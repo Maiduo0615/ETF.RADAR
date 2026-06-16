@@ -296,67 +296,167 @@ async function getEtf(market, symbol) {
   return { market: 'US', symbol: sym, name: names[sym] || '', ...out };
 }
 
-async function fetchWantgooMainNumber(url, patterns, min, max) {
-  const html = await fetchText(url, 8000);
+async function fetchWantgooMainNumber(url, kind) {
+  const html = await fetchText(url, 10000);
   const plain = cleanHtml(html);
-  const text = `${plain} ${String(html).replace(/,/g, ' ')}`;
-  for (const pattern of patterns) {
-    const re = new RegExp(pattern + '[\\s\\S]{0,240}?([0-9]{1,6}(?:\\.[0-9]+)?)', 'i');
-    const m = text.match(re);
-    if (m) {
-      const n = Number(m[1]);
-      if (Number.isFinite(n) && n >= min && n <= max) return n;
+  const raw = String(html || '').replace(/,/g, ' ');
+  const text = `${plain} ${raw}`;
+  const firstDecimal = (segment, min, max) => {
+    const matches = [...String(segment || '').matchAll(/\b([0-9]{1,3}\.[0-9]{1,2})\b/g)]
+      .map(m => Number(m[1]))
+      .filter(n => Number.isFinite(n) && n >= min && n <= max);
+    return matches.length ? matches[0] : null;
+  };
+  if (kind === 'vixtwn') {
+    const anchor = text.search(/VIXTWN|臺指選擇權波動率指數|台指選擇權波動率指數/i);
+    if (anchor >= 0) {
+      const seg = text.slice(anchor, anchor + 1200);
+      const n = firstDecimal(seg, 5, 100);
+      if (valid(n)) return n;
     }
+    const n = firstDecimal(text, 5, 100);
+    return valid(n) ? n : null;
   }
-  const nums = [...plain.matchAll(/\b([0-9]{1,6}(?:\.[0-9]+)?)\b/g)].map(m => Number(m[1])).filter(n => n >= min && n <= max);
-  return nums.length ? nums[0] : null;
+  if (kind === 'sp') {
+    const anchor = text.search(/S\s*&\s*P\s*500|S&P500|SP5|標普500/i);
+    if (anchor >= 0) {
+      const seg = text.slice(anchor, anchor + 1200);
+      const matches = [...seg.matchAll(/\b([0-9]{4,5}\.[0-9]{1,2})\b/g)]
+        .map(m => Number(m[1]))
+        .filter(n => Number.isFinite(n) && n >= 3000 && n <= 20000);
+      if (matches.length) return matches[0];
+    }
+    return null;
+  }
+  return null;
 }
 
 async function fetchFearGreed() {
   const url = 'https://www.wantgoo.com/global/macroeconomics/fearandgreed';
-  const html = await fetchText(url, 8000);
+  const html = await fetchText(url, 10000);
   const plain = cleanHtml(html);
-  const text = `${plain} ${String(html).replace(/,/g, ' ')}`;
-  const patterns = [
-    /市場即時情緒指標[\s\S]{0,120}?(\d{1,3})(?!\d)/i,
-    /恐懼與貪婪指數[\s\S]{0,240}?市場即時情緒指標[\s\S]{0,120}?(\d{1,3})(?!\d)/i,
-    /Fear\s*&\s*Greed[\s\S]{0,240}?(\d{1,3})(?!\d)/i
+  const raw = String(html || '').replace(/,/g, ' ');
+  const text = `${plain} ${raw}`;
+
+  const candidates = [];
+  const pushCandidate = (n, score) => {
+    n = Number(n);
+    if (Number.isFinite(n) && n >= 0 && n <= 100) candidates.push({ n, score });
+  };
+
+  const mainPatterns = [
+    /市場即時情緒指標[^0-9]{0,120}(\d{1,3})(?!\d)/i,
+    /恐懼與貪婪指數[\s\S]{0,360}?市場即時情緒指標[^0-9]{0,120}(\d{1,3})(?!\d)/i,
+    /當日[\s\S]{0,160}?(?:極度恐懼|恐懼|中立|貪婪|極度貪婪)[^0-9]{0,80}(\d{1,3})(?!\d)/i
   ];
-  for (const re of patterns) {
+  for (const re of mainPatterns) {
     const m = text.match(re);
-    if (m) {
+    if (m) pushCandidate(m[1], 100);
+  }
+
+  const anchor = text.search(/市場即時情緒指標|恐懼與貪婪指數/i);
+  if (anchor >= 0) {
+    const seg = text.slice(anchor, anchor + 900);
+    for (const m of seg.matchAll(/\b(\d{1,3})\b/g)) {
+      const idx = m.index || 0;
       const n = Number(m[1]);
-      if (Number.isFinite(n) && n >= 0 && n <= 100) return n;
+      // Skip obvious date fragments such as 2026/06/17 by ignoring tiny values very near 年/月/日 characters.
+      const around = seg.slice(Math.max(0, idx - 8), idx + 12);
+      if (/20\d{2}|\/|年|月|日|:/.test(around) && n < 31) continue;
+      pushCandidate(n, 80 - idx / 100);
     }
   }
+
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates.length ? candidates[0].n : null;
+}
+
+async function fetchUsdTwd() {
+  const sources = [
+    async () => {
+      const j = await fetchJson('https://api.frankfurter.app/latest?from=USD&to=TWD', 7000);
+      return j?.rates?.TWD;
+    },
+    async () => {
+      const j = await fetchJson('https://open.er-api.com/v6/latest/USD', 7000);
+      return j?.rates?.TWD;
+    }
+  ];
+  for (const fn of sources) {
+    try {
+      const n = Number(await fn());
+      if (Number.isFinite(n) && n > 20 && n < 45) return n;
+    } catch (_) {}
+  }
   return null;
+}
+
+async function fetchTwIndexHistory() {
+  const closes = [], highs = [], lows = [], dates = [];
+  const now = new Date();
+  for (let i = 0; i < 14; i++) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const date = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}01`;
+    const urls = [
+      `https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST?response=json&date=${date}`,
+      `https://www.twse.com.tw/indicesReport/MI_5MINS_HIST?response=json&date=${date}`
+    ];
+    for (const url of urls) {
+      try {
+        const j = await fetchJson(url, 7000);
+        const rows = Array.isArray(j?.data) ? j.data : [];
+        if (!rows.length) continue;
+        const parsed = rows.map(r => ({
+          date: String(r[0] || ''),
+          high: numTW(r[2]),
+          low: numTW(r[3]),
+          close: numTW(r[4])
+        })).filter(x => valid(x.close));
+        parsed.reverse().forEach(x => {
+          closes.unshift(x.close);
+          highs.unshift(valid(x.high) ? x.high : x.close);
+          lows.unshift(valid(x.low) ? x.low : x.close);
+          dates.unshift(x.date);
+        });
+        break;
+      } catch (_) {}
+    }
+  }
+  if (!closes.length) return null;
+  return { closes, highs, lows, dates, date: dates.at(-1) || today(), source: 'TWSE TAIEX' };
 }
 
 async function getMarket() {
   const result = {
     updatedAt: new Date().toISOString(),
-    twIndex: null, sp500: null, nasdaq: null, vix: null, fearGreed: null, vixtwn: null
+    usdTwd: null, twIndex: null, sp500: null, nasdaq: null, vix: null, fearGreed: null, vixtwn: null
   };
   await Promise.allSettled([
     (async () => {
-      const h = await fetchYahooChart('^TWII', '1y');
+      const n = await fetchUsdTwd();
+      if (valid(n)) result.usdTwd = { value: n, source: 'Frankfurter / ER API' };
+    })(),
+    (async () => {
+      const h = await fetchTwIndexHistory();
       if (h) result.twIndex = { ...normalizeHist(h), label: '台股加權' };
     })(),
     (async () => {
-      const h = await fetchStooqHistory('^spx');
+      let h = null;
+      try { h = await fetchStooqHistory('^spx'); } catch (_) {}
+      if (!h) { try { h = await fetchYahooChart('^GSPC', '1y'); } catch (_) {} }
       if (h) result.sp500 = { ...normalizeHist(h), label: 'S&P500' };
     })(),
     (async () => {
-      try {
-        const h = await fetchYahooChart('^IXIC', '1y');
-        if (h) result.nasdaq = { ...normalizeHist(h), label: 'NASDAQ Composite' };
-      } catch (_) {
-        const h = await fetchStooqHistory('^ndx');
-        if (h) result.nasdaq = { ...normalizeHist(h), label: 'NASDAQ 100' };
-      }
+      let h = null;
+      try { h = await fetchYahooChart('^IXIC', '1y'); } catch (_) {}
+      if (!h) { try { h = await fetchStooqHistory('^ixic'); } catch (_) {} }
+      if (!h) { try { h = await fetchStooqHistory('^ndx'); } catch (_) {} }
+      if (h) result.nasdaq = { ...normalizeHist(h), label: h.source === 'Stooq' ? 'NASDAQ' : 'NASDAQ Composite' };
     })(),
     (async () => {
-      const h = await fetchYahooChart('^VIX', '1mo');
+      let h = null;
+      try { h = await fetchStooqHistory('^vix'); } catch (_) {}
+      if (!h) { try { h = await fetchYahooChart('^VIX', '1mo'); } catch (_) {} }
       if (h) result.vix = { ...normalizeHist(h), label: 'VIX' };
     })(),
     (async () => {
@@ -364,7 +464,7 @@ async function getMarket() {
       if (fg !== null) result.fearGreed = { value: fg, source: 'Wantgoo', url: 'https://www.wantgoo.com/global/macroeconomics/fearandgreed' };
     })(),
     (async () => {
-      const v = await fetchWantgooMainNumber('https://www.wantgoo.com/index/vixtwn', ['VIXTWN', '臺指選擇權波動率指數', '台指選擇權波動率指數'], 1, 100);
+      const v = await fetchWantgooMainNumber('https://www.wantgoo.com/index/vixtwn', 'vixtwn');
       if (valid(v)) result.vixtwn = { value: v, source: 'Wantgoo', url: 'https://www.wantgoo.com/index/vixtwn' };
     })()
   ]);
