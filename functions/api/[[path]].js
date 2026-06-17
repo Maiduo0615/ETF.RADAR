@@ -19,42 +19,31 @@ async function fetchWantgooPremium(symbol) {
     const raw = await fetchText(url, 12000);
     const plain = cleanHtml(raw);
     const sym = String(symbol).toUpperCase();
-    const candidates = [plain, String(raw || '').replace(/,/g, ' ')];
     const takeNumber = (v) => {
       const n = Number(String(v ?? '').replace(/%/g, '').replace(/,/g, '').trim());
-      return Number.isFinite(n) && Math.abs(n) < 20 ? n : null;
+      return Number.isFinite(n) && Math.abs(n) < 50 ? n : null;
     };
-    const extract = (seg) => {
-      const keyed = [
-        /折溢價(?:率|幅度|差)?[^-+0-9]{0,80}([-+]?\d{1,3}(?:\.\d+)?)\s*%/i,
-        /([-+]?\d{1,3}(?:\.\d+)?)\s*%[^%]{0,80}(?:折溢價|溢價|折價)/i,
-        /["'](?:discount|premium|premiumDiscount|discountPremium|spread|g)["']\s*:\s*["']?([-+]?\d{1,3}(?:\.\d+)?)["']?/i
-      ];
-      for (const re of keyed) {
-        const m = seg.match(re);
-        const n = m ? takeNumber(m[1]) : null;
-        if (n !== null) return n;
-      }
-      // Fallback: row/table text often places several percentages after the ETF code.
-      // Prefer percentages close to words related to NAV; otherwise choose the first plausible small % in the symbol row.
-      const pcts = [...seg.matchAll(/([-+]?\d{1,2}(?:\.\d{1,2})?)\s*%/g)]
-        .map(m => ({ n: takeNumber(m[1]), i: m.index || 0, ctx: seg.slice(Math.max(0, (m.index||0)-50), (m.index||0)+50) }))
-        .filter(x => x.n !== null && Math.abs(x.n) <= 10);
-      const navRelated = pcts.find(x => /淨值|折溢價|溢價|折價|NAV|nav/i.test(x.ctx));
-      if (navRelated) return navRelated.n;
-      return pcts.length ? pcts[0].n : null;
+    const parseRow = (seg) => {
+      // 玩股網列格式：代碼 名稱 淨值 淨值漲跌% 市價 市價漲跌% 折溢價 折溢價% 成交量 追蹤標的
+      // 例如：009816 凱基台灣TOP50 15.37 3.15% 15.51 0.85% 0.14 0.91% 123512 ...
+      const row = seg.replace(/\s+/g, ' ').trim();
+      const re = new RegExp(`${sym}\\s+[^0-9]{1,80}\\s+([0-9]{1,5}(?:\\.[0-9]+)?)\\s+[-+]?\\d{1,3}(?:\\.\\d+)?%\\s+([0-9]{1,5}(?:\\.[0-9]+)?)\\s+[-+]?\\d{1,3}(?:\\.\\d+)?%\\s+([-+]?\\d{1,4}(?:\\.\\d+)?)\\s+([-+]?\\d{1,3}(?:\\.\\d+)?)%`, 'i');
+      const m = row.match(re);
+      if (m) return takeNumber(m[4]);
+      // 備援：從代碼後的同一列抓所有百分比，第三個百分比才是「折溢價%」。
+      const pct = [...row.matchAll(/([-+]?\d{1,3}(?:\.\d+)?)\s*%/g)].map(x => takeNumber(x[1])).filter(x => x !== null);
+      if (pct.length >= 3) return pct[2];
+      const keyed = row.match(/折溢價%?\s*([-+]?\d{1,3}(?:\.\d+)?)\s*%/i) || row.match(/([-+]?\d{1,3}(?:\.\d+)?)\s*%\s*(?:折溢價|溢價|折價)/i);
+      if (keyed) return takeNumber(keyed[1]);
+      return null;
     };
-    for (const text of candidates) {
+    for (const text of [plain, String(raw || '').replace(/,/g, ' ')]) {
       const idx = text.toUpperCase().indexOf(sym);
       if (idx < 0) continue;
-      const seg = text.slice(idx, idx + 1800);
-      const row = seg.match(/^.{1,100}?\s+([0-9]{1,4}(?:\.\d+)?)\s+[-+]?\d{1,3}(?:\.\d+)?%\s+([0-9]{1,4}(?:\.\d+)?)\s+[-+]?\d{1,3}(?:\.\d+)?%\s+[-+]?\d{1,3}(?:\.\d+)?\s+([-+]?\d{1,3}(?:\.\d+)?)%/i);
-      if (row) {
-        const n = takeNumber(row[3]);
-        if (n !== null) return { premiumDiscount: n, source: 'Wantgoo ETF NAV', sourceUrl: url };
-      }
-      const n = extract(seg);
-      if (n !== null) return { premiumDiscount: n, source: 'Wantgoo ETF NAV', sourceUrl: url };
+      const lineEnd = text.indexOf('\n', idx);
+      const seg = text.slice(idx, lineEnd > idx ? lineEnd : idx + 900);
+      const n = parseRow(seg);
+      if (n !== null) return { premiumDiscount: n, source: '玩股網 ETF 淨值折溢價', sourceUrl: url };
     }
     return null;
   } catch (_) { return null; }
@@ -67,10 +56,16 @@ async function getEtf(market, symbol) { const m = String(market || '').toUpperCa
   const hist = await fetchUSHistory(sym); const out = normalizeHist(hist) || {}; out.kdj = calcKDJ(hist); out.sources = []; if (hist) out.sources.push({ name: hist.source || 'US data', role: 'history', url: hist.sourceUrl || '' }); out.sources.push({ name: 'Yahoo Finance', role: 'backup', url: `https://finance.yahoo.com/quote/${sym}` }); const names = { VOO: 'Vanguard S&P 500 ETF', VTI: 'Vanguard Total Stock Market ETF', VT: 'Vanguard Total World Stock ETF', QQQ: 'Invesco QQQ Trust', SPY: 'SPDR S&P 500 ETF', SCHD: 'Schwab US Dividend Equity ETF', IVV: 'iShares Core S&P 500 ETF', DIA: 'SPDR Dow Jones Industrial Average ETF', SMH: 'VanEck Semiconductor ETF', SOXX: 'iShares Semiconductor ETF' }; return { market: 'US', symbol: sym, name: names[sym] || '', ...out };
 }
 
+function normalizeDateString(d) {
+  const s = String(d || '').trim().replace(/年|\//g, '-').replace(/月/g, '-').replace(/日/g, '');
+  const roc = s.match(/^(\d{2,3})-(\d{1,2})-(\d{1,2})$/);
+  if (roc) return `${Number(roc[1]) + 1911}-${String(roc[2]).padStart(2, '0')}-${String(roc[3]).padStart(2, '0')}`;
+  const m = s.match(/^(20\d{2})-(\d{1,2})-(\d{1,2})/);
+  return m ? `${m[1]}-${String(m[2]).padStart(2, '0')}-${String(m[3]).padStart(2, '0')}` : today();
+}
 function parseDateFromText(text) {
-  const m = String(text || '').match(/20\d{2}[\/-]\d{1,2}[\/-]\d{1,2}|20\d{2}年\d{1,2}月\d{1,2}日/);
-  if (!m) return today();
-  return m[0].replace(/年|\//g, '-').replace(/月/g, '-').replace(/日/g, '').replace(/-(\d)(?=-|$)/g, '-0$1');
+  const m = String(text || '').match(/20\d{2}[\/-]\d{1,2}[\/-]\d{1,2}|20\d{2}年\d{1,2}月\d{1,2}日|\b\d{2,3}[\/-]\d{1,2}[\/-]\d{1,2}\b/);
+  return m ? normalizeDateString(m[0]) : today();
 }
 function numCandidatesNear(text, anchorWords, maxLen, min, max, decimalsOnly=false) {
   const anchor = String(text || '').search(anchorWords);
@@ -87,30 +82,15 @@ async function fetchWantgooMainNumber(url, kind) {
   if (kind === 'vixtwn') {
     const date = parseDateFromText(text);
     const okVix = v => Number.isFinite(Number(v)) && Number(v) >= 5 && Number(v) <= 100;
-    const normalizeDate = d => String(d || date).replace(/\//g, '-');
-
-    // 最高優先：玩股網頁面左側「主報價」大數字。
-    // 版面文字通常為：臺指選擇權波動率指數 VIXTWN 2026-06-17 09:07 ... 39.47 ▲0.45 1.15% 開盤...
-    // 這裡明確要求後面要接漲跌點與漲跌幅，避免抓到昨收 / 開盤 / 最高 / 最低。
-    const mainQuotePatterns = [
-      /(?:臺指選擇權波動率指數|台指選擇權波動率指數)[\s\S]{0,80}?VIXTWN[\s\S]{0,120}?(20\d{2}[-\/]\d{1,2}[-\/]\d{1,2})\s+\d{1,2}:\d{2}[\s\S]{0,260}?\b(\d{1,3}\.\d{2})\b\s*(?:▲|▼|\+|-)?\s*[-+]?\d{1,3}(?:\.\d+)?\s+[-+]?\d{1,3}(?:\.\d+)?%/i,
-      /VIXTWN[\s\S]{0,120}?(20\d{2}[-\/]\d{1,2}[-\/]\d{1,2})\s+\d{1,2}:\d{2}[\s\S]{0,260}?\b(\d{1,3}\.\d{2})\b\s*(?:▲|▼|\+|-)?\s*[-+]?\d{1,3}(?:\.\d+)?\s+[-+]?\d{1,3}(?:\.\d+)?%/i,
-      /(?:自選股|登入免費用|免費用)[\s\S]{0,180}?\b(\d{1,3}\.\d{2})\b\s*(?:▲|▼|\+|-)?\s*[-+]?\d{1,3}(?:\.\d+)?\s+[-+]?\d{1,3}(?:\.\d+)?%/i
-    ];
-    for (const re of mainQuotePatterns) {
-      const m = text.match(re);
-      const v = m ? Number(m[2] || m[1]) : NaN;
-      const d = m && m[2] ? m[1] : date;
-      if (okVix(v)) return { value: v, date: normalizeDate(d), source: 'Wantgoo 主報價', url };
-    }
-
-    // 備援：從 VIXTWN 標題附近找「數字 + 漲跌 + 漲跌幅」組合，排除 OHLC 標籤。
-    const idx = text.search(/VIXTWN|臺指選擇權波動率指數|台指選擇權波動率指數/i);
-    const seg = idx >= 0 ? text.slice(idx, idx + 1200) : text.slice(0, 1200);
-    const combos = [...seg.matchAll(/\b(\d{1,3}\.\d{2})\b\s*(?:▲|▼|\+|-)?\s*[-+]?\d{1,3}(?:\.\d+)?\s+[-+]?\d{1,3}(?:\.\d+)?%/g)]
-      .map(m => ({ n: Number(m[1]), around: seg.slice(Math.max(0, (m.index||0)-45), (m.index||0)+80) }))
-      .filter(x => okVix(x.n) && !/(昨收|開盤|最高|最低|離季線|本益比|股淨比|殖利率)/.test(x.around));
-    if (combos.length) return { value: combos[0].n, date, source: 'Wantgoo 主報價', url };
+    const idx = text.search(/VIXTWN/i);
+    const seg = idx >= 0 ? text.slice(idx, idx + 700) : text.slice(0, 700);
+    // 玩股網主報價固定出現在 VIXTWN 日期時間之後、開盤/昨收之前，且下一組是漲跌與漲跌幅。
+    const m = seg.match(/VIXTWN\s+(20\d{2}[\/-]\d{1,2}[\/-]\d{1,2})\s+\d{1,2}:\d{2}[\s\S]{0,180}?\b(\d{1,3}\.\d{2})\b\s*[-+▲▼]?\s*\d{1,3}(?:\.\d+)?\s+[-+]?\d{1,3}(?:\.\d+)?%/i);
+    if (m && okVix(Number(m[2]))) return { value: Number(m[2]), date: normalizeDateString(m[1]), source: '玩股網 VIXTWN 主報價', url };
+    const combo = [...seg.matchAll(/\b(\d{1,3}\.\d{2})\b\s*[-+▲▼]?\s*\d{1,3}(?:\.\d+)?\s+[-+]?\d{1,3}(?:\.\d+)?%/g)]
+      .map(x => ({ n: Number(x[1]), around: seg.slice(Math.max(0, (x.index || 0) - 60), (x.index || 0) + 100) }))
+      .find(x => okVix(x.n) && !/(開盤|昨收|最高|最低|離季線|本益比|殖利率|股淨比)/.test(x.around));
+    if (combo) return { value: combo.n, date, source: '玩股網 VIXTWN 主報價', url };
   }
   return null;
 }
@@ -120,33 +100,21 @@ async function fetchFearGreed() {
   const plain = cleanHtml(html);
   const rawText = String(html || '').replace(/,/g, ' ');
   const text = `${plain} ${rawText}`;
-  const date = parseDateFromText(text);
   const ok = n => Number.isFinite(Number(n)) && Number(n) >= 0 && Number(n) <= 100;
-  const normalizeDate = d => String(d || date).replace(/\//g, '-');
-  const isScale = n => [0,25,50,75,100].includes(Number(n));
-
-  // 最高優先：主儀表中央大數字，也就是「市場即時情緒指標」附近、且不是 0/25/50/75/100 刻度的數字。
-  // 使用距離 marker 最近的候選，避免誤抓右側「當日 / 前一交易日 / 一週前」歷史表格。
+  const date = parseDateFromText(text);
+  // 玩股網文字順序：... 0 25 50 75 100 ... 41 市場即時情緒指標
+  // 取「市場即時情緒指標」前方最後一個 0~100 數字，避開刻度 0/25/50/75/100 與右側歷史表格。
   const marker = text.search(/市場即時情緒指標/i);
   if (marker >= 0) {
-    const from = Math.max(0, marker - 700);
-    const to = Math.min(text.length, marker + 260);
-    const seg = text.slice(from, to);
-    const candidates = [...seg.matchAll(/\b(\d{1,3})\b/g)]
-      .map(m => ({ n: Number(m[1]), abs: from + (m.index || 0), around: seg.slice(Math.max(0,(m.index||0)-25),(m.index||0)+35) }))
-      .filter(x => ok(x.n) && !isScale(x.n) && !/20\d{2}|\d{1,2}:\d{2}|年|月|日|\/|-/.test(x.around));
-    if (candidates.length) {
-      candidates.sort((a,b) => Math.abs(a.abs - marker) - Math.abs(b.abs - marker));
-      return { value: candidates[0].n, date, source: 'Wantgoo 主儀表', url };
+    const before = text.slice(Math.max(0, marker - 500), marker);
+    const nums = [...before.matchAll(/\b(\d{1,3})\b/g)].map(m => Number(m[1])).filter(ok);
+    for (let i = nums.length - 1; i >= 0; i--) {
+      const n = nums[i];
+      if (![0,25,50,75,100].includes(n)) return { value: n, date, source: '玩股網 F&G 主儀表', url };
     }
   }
-
-  // 備援：若主儀表文字被前端拆散，才抓右側市場情緒變化趨勢的「當日」列。
-  const todayRow = text.match(/當日[\s\S]{0,80}?(20\d{2}[\/\-]\d{1,2}[\/\-]\d{1,2})[\s\S]{0,80}?(?:極度恐懼|恐懼|中立|極度貪婪|貪婪)\s+(\d{1,3})(?!\d)/i);
-  if (todayRow && ok(todayRow[2])) return { value: Number(todayRow[2]), date: normalizeDate(todayRow[1]), source: 'Wantgoo 趨勢表', url };
-
-  const trend = text.match(/市場情緒變化趨勢[\s\S]{0,600}?當日[\s\S]{0,80}?(20\d{2}[\/\-]\d{1,2}[\/\-]\d{1,2})[\s\S]{0,100}?(\d{1,3})(?!\d)/i);
-  if (trend && ok(trend[2]) && !isScale(trend[2])) return { value: Number(trend[2]), date: normalizeDate(trend[1]), source: 'Wantgoo 趨勢表', url };
+  const todayRow = text.match(/當日\s+(20\d{2}[\/-]\d{1,2}[\/-]\d{1,2})\s+(?:極度恐懼|恐懼|中立|極度貪婪|貪婪)\s+(\d{1,3})/i);
+  if (todayRow && ok(Number(todayRow[2]))) return { value: Number(todayRow[2]), date: normalizeDateString(todayRow[1]), source: '玩股網 F&G 趨勢表', url };
   return null;
 }
 async function fetchUsdTwd() { for (const fn of [async()=> (await fetchJson('https://api.frankfurter.app/latest?from=USD&to=TWD', 7000))?.rates?.TWD, async()=> (await fetchJson('https://open.er-api.com/v6/latest/USD', 7000))?.rates?.TWD]) { try { const n = Number(await fn()); if (n > 20 && n < 45) return n; } catch (_) {} } return null; }
