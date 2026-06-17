@@ -79,12 +79,26 @@ async function fetchWantgooMainNumber(url, kind) {
   const plain = cleanHtml(html);
   const text = `${plain} ${String(html || '').replace(/,/g, ' ')}`;
   if (kind === 'vixtwn') {
-    const anchor = /VIXTWN|臺指選擇權波動率指數|台指選擇權波動率指數/i;
-    // 優先抓主報價區第一個合理小數，避免抓到日期或百分比說明。
-    const direct = numCandidatesNear(text, anchor, 1800, 5, 100, true);
-    if (direct.length) return { value: direct[0].n, date: parseDateFromText(text), source: 'Wantgoo', url };
-    const fallback = numCandidatesNear(text, anchor, 2200, 5, 100, false);
-    if (fallback.length) return { value: fallback[0].n, date: parseDateFromText(text), source: 'Wantgoo', url };
+    const date = parseDateFromText(text);
+    // 玩股網主報價區格式：VIXTWN 2026-06-16 13:45 ... 39.02 -0.95 -2.38%
+    const primary = text.match(/VIXTWN\s+(\d{4}-\d{2}-\d{2})\s+\d{1,2}:\d{2}[\s\S]{0,260}?\b(\d{2,3}\.\d{2})\b\s+[-+]?\d+(?:\.\d+)?\s+[-+]?\d+(?:\.\d+)?%/i);
+    if (primary) {
+      const v = Number(primary[2]);
+      if (valid(v) && v >= 5 && v <= 100) return { value: v, date: primary[1], source: 'Wantgoo', url };
+    }
+    const titleBlock = text.match(/臺指選擇權波動率指數[\s\S]{0,900}?VIXTWN[\s\S]{0,900}?\b(\d{2,3}\.\d{2})\b\s+[-+]?\d+(?:\.\d+)?\s+[-+]?\d+(?:\.\d+)?%/i);
+    if (titleBlock) {
+      const v = Number(titleBlock[1]);
+      if (valid(v) && v >= 5 && v <= 100) return { value: v, date, source: 'Wantgoo', url };
+    }
+    const candle = text.match(/\*\s*(\d{4}-\d{2}-\d{2})\s*\*\s*(\d{2,3}\.\d{2})\s+[-+]?\d+(?:\.\d+)?\s*\([-+]?\d+(?:\.\d+)?%\)/i);
+    if (candle) {
+      const v = Number(candle[2]);
+      if (valid(v) && v >= 5 && v <= 100) return { value: v, date: candle[1], source: 'Wantgoo', url };
+    }
+    const direct = numCandidatesNear(text, /VIXTWN|臺指選擇權波動率指數|台指選擇權波動率指數/i, 1800, 5, 100, true)
+      .filter(x => !/(13\.45|13\.30|2026|06\.16)/.test(String(x.around)));
+    if (direct.length) return { value: direct[0].n, date, source: 'Wantgoo', url };
   }
   return null;
 }
@@ -94,26 +108,35 @@ async function fetchFearGreed() {
   const plain = cleanHtml(html);
   const text = `${plain} ${String(html || '').replace(/,/g, ' ')}`;
   const date = parseDateFromText(text);
-  // 最高優先：玩股網頁面「當日數值」位置，這是目前正確值所在。
+  // 最高優先：玩股網「當日 2026/06/16 恐懼 41」位置。
+  const todayRow = text.match(/當日\s+(\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2})\s*(?:極度恐懼|恐懼|中立|貪婪|極度貪婪)?\s*(\d{1,3})(?!\d)/i);
+  if (todayRow) {
+    const n = Number(todayRow[2]);
+    if (Number.isFinite(n) && n >= 0 && n <= 100) return { value: n, date: todayRow[1].replace(/\//g,'-'), source: 'Wantgoo', url };
+  }
+  // 第二優先：主儀表值位於「41 市場即時情緒指標」前方。
+  const gauge = text.match(/(?:^|\s)(\d{1,3})(?!\d)\s*市場即時情緒指標/i);
+  if (gauge) {
+    const n = Number(gauge[1]);
+    if (Number.isFinite(n) && n >= 0 && n <= 100) return { value: n, date, source: 'Wantgoo', url };
+  }
   const patterns = [
     /當日數值[^0-9]{0,120}(\d{1,3})(?!\d)/i,
-    /當日[^0-9]{0,60}數值[^0-9]{0,120}(\d{1,3})(?!\d)/i,
-    /市場即時情緒指標[^0-9]{0,220}(\d{1,3})(?!\d)/i,
-    /恐懼與貪婪指數[\s\S]{0,650}?當日數值[^0-9]{0,120}(\d{1,3})(?!\d)/i
+    /恐懼與貪婪指數[\s\S]{0,450}?市場即時情緒指標[^0-9]{0,160}(\d{1,3})(?!\d)/i
   ];
   for (const re of patterns) {
     const m = text.match(re);
     if (m) {
       const n = Number(m[1]);
-      if (Number.isFinite(n) && n >= 0 && n <= 100) return { value: n, date, source: 'Wantgoo', url };
+      if (Number.isFinite(n) && n >= 10 && n <= 100) return { value: n, date, source: 'Wantgoo', url };
     }
   }
-  const anchor = text.search(/當日數值|市場即時情緒指標|恐懼與貪婪指數/i);
+  const anchor = text.search(/當日|市場即時情緒指標|恐懼與貪婪指數/i);
   if (anchor >= 0) {
     const seg = text.slice(anchor, anchor + 1200);
     const nums = [...seg.matchAll(/\b(\d{1,3})\b/g)]
       .map(m => ({ n: Number(m[1]), idx: m.index || 0, around: seg.slice(Math.max(0, (m.index || 0)-18), (m.index || 0)+24) }))
-      .filter(x => x.n >= 0 && x.n <= 100 && !/20\d{2}|年|月|日|:|\//.test(x.around));
+      .filter(x => x.n >= 10 && x.n <= 100 && !/20\d{2}|年|月|日|:|\//.test(x.around));
     if (nums.length) return { value: nums.sort((a,b)=>a.idx-b.idx)[0].n, date, source: 'Wantgoo', url };
   }
   return null;
