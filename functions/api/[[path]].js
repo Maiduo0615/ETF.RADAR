@@ -186,38 +186,92 @@ function ndcMonth(x) {
   if (s.length >= 6) return `${s.slice(0,4)}-${s.slice(4,6)}`;
   return today().slice(0,7);
 }
-async function fetchNdcLightScore() {
-  const url = 'https://index.ndc.gov.tw/n/json/lightscore';
-  const ctl = new AbortController();
-  const id = setTimeout(() => ctl.abort(), 12000);
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      signal: ctl.signal,
-      headers: {
-        'user-agent': 'Mozilla/5.0 (ETF Radar V4)',
-        'accept': 'application/json,text/plain,*/*',
-        'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        'origin': 'https://index.ndc.gov.tw',
-        'referer': 'https://index.ndc.gov.tw/n/zh_tw/lightscore#/'
-      },
-      body: ''
+async function parseNdcJsonText(text, url) {
+  let data = null;
+  try { data = JSON.parse(text); } catch (_) {}
+  const pools = [];
+  const pushArr = a => { if (Array.isArray(a)) pools.push(a); };
+  pushArr(data?.line); pushArr(data?.data); pushArr(data?.rows); pushArr(data?.list);
+  if (data && typeof data === 'object') {
+    for (const v of Object.values(data)) if (Array.isArray(v)) pools.push(v);
+  }
+  for (const arr of pools) {
+    const last = [...arr].reverse().find(x => {
+      const vals = Object.values(x || {});
+      return vals.some(v => Number.isFinite(Number(String(v).replace(/[^0-9.]/g,''))) && Number(String(v).replace(/[^0-9.]/g,'')) >= 9 && Number(String(v).replace(/[^0-9.]/g,'')) <= 45);
     });
-    const text = await res.text();
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
-    const data = JSON.parse(text);
-    const line = Array.isArray(data?.line) ? data.line : [];
-    const last = [...line].reverse().find(x => Number.isFinite(Number(x?.y)));
-    if (!last) return null;
-    const value = Number(last.y);
-    return {
-      value,
-      light: ndcLightLabel(value),
-      date: ndcMonth(last.x),
-      source: '國發會景氣對策信號',
-      url: 'https://index.ndc.gov.tw/n/zh_tw/lightscore#/'
-    };
-  } finally { clearTimeout(id); }
+    if (last) {
+      const entries = Object.entries(last);
+      let value = null;
+      for (const [k,v] of entries) {
+        const n = Number(String(v).replace(/[^0-9.]/g,''));
+        if (Number.isFinite(n) && n >= 9 && n <= 45 && !/year|month|date|time|年月|期間/i.test(k)) { value = n; break; }
+      }
+      const dateVal = last.x || last.date || last.yyyymm || last.time || last.period || last['年月'] || last['資料年月'];
+      if (value !== null) return { value, light: ndcLightLabel(value), date: ndcMonth(dateVal), source: '國發會景氣對策信號 API', url };
+    }
+  }
+  return null;
+}
+async function fetchNdcNewsFallback() {
+  const urls = [
+    'https://www.ndc.gov.tw/nc_14813_39873',
+    'https://www.ndc.gov.tw/nc_14813_39634',
+    'https://www.ndc.gov.tw/nc_14813_39303'
+  ];
+  for (const url of urls) {
+    try {
+      const html = await fetchText(url, 12000);
+      const plain = cleanHtml(html);
+      if (!/景氣燈號|景氣對策信號/.test(plain)) continue;
+      const m = plain.match(/(\d{2,3})年(\d{1,2})月景氣對策信號綜合判斷分數為\s*(\d{1,2})分[，,][^。；]*?(紅燈|黃紅燈|綠燈|黃藍燈|藍燈)/);
+      if (m) {
+        const y = Number(m[1]) + 1911; const mo = String(m[2]).padStart(2,'0'); const value = Number(m[3]);
+        return { value, light: m[4], date: `${y}-${mo}`, source: '國發會新聞稿備援', url };
+      }
+      const m2 = plain.match(/(\d{2,3})年(\d{1,2})月[^。]{0,80}?(紅燈|黃紅燈|綠燈|黃藍燈|藍燈)[^。]{0,80}?分數為\s*(\d{1,2})分/);
+      if (m2) {
+        const y = Number(m2[1]) + 1911; const mo = String(m2[2]).padStart(2,'0'); const value = Number(m2[4]);
+        return { value, light: m2[3], date: `${y}-${mo}`, source: '國發會新聞稿備援', url };
+      }
+    } catch (_) {}
+  }
+  return null;
+}
+async function fetchNdcLightScore() {
+  const candidates = [
+    { url: 'https://index.ndc.gov.tw/n/json/lightscore', method: 'POST', body: '' },
+    { url: 'https://index.ndc.gov.tw/n/json/lightscore', method: 'GET' },
+    { url: 'https://index.ndc.gov.tw/n/json/line/lightscore', method: 'GET' },
+    { url: 'https://index.ndc.gov.tw/n/json/data/lightscore', method: 'GET' }
+  ];
+  for (const c of candidates) {
+    const ctl = new AbortController();
+    const id = setTimeout(() => ctl.abort(), 12000);
+    try {
+      const res = await fetch(c.url, {
+        method: c.method || 'GET',
+        signal: ctl.signal,
+        headers: {
+          'user-agent': 'Mozilla/5.0 (ETF Radar V4)',
+          'accept': 'application/json,text/plain,*/*',
+          'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'origin': 'https://index.ndc.gov.tw',
+          'referer': 'https://index.ndc.gov.tw/n/zh_tw/lightscore#/'
+        },
+        body: c.body
+      });
+      const text = await res.text();
+      if (res.ok) {
+        const parsed = await parseNdcJsonText(text, c.url);
+        if (parsed) return parsed;
+      }
+    } catch (_) {
+    } finally { clearTimeout(id); }
+  }
+  const news = await fetchNdcNewsFallback();
+  if (news) return news;
+  return null;
 }
 
 async function debugRaw(target, symbol='009816') {
@@ -238,4 +292,4 @@ async function debugRaw(target, symbol='009816') {
 async function fetchUsdTwd() { for (const fn of [async()=> (await fetchJson('https://api.frankfurter.app/latest?from=USD&to=TWD', 7000))?.rates?.TWD, async()=> (await fetchJson('https://open.er-api.com/v6/latest/USD', 7000))?.rates?.TWD]) { try { const n = Number(await fn()); if (n > 20 && n < 45) return n; } catch (_) {} } return null; }
 async function fetchTwIndexHistory() { const closes=[], highs=[], lows=[], dates=[]; const now=new Date(); for (let i=0;i<14;i++){ const d=new Date(now.getFullYear(),now.getMonth()-i,1); const date=`${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}01`; for (const url of [`https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST?response=json&date=${date}`,`https://www.twse.com.tw/indicesReport/MI_5MINS_HIST?response=json&date=${date}`]){ try{ const j=await fetchJson(url,7000); const rows=Array.isArray(j?.data)?j.data:[]; if(!rows.length) continue; rows.map(r=>({date:String(r[0]||''), high:num(r[2]), low:num(r[3]), close:num(r[4])})).filter(x=>valid(x.close)).reverse().forEach(x=>{closes.unshift(x.close); highs.unshift(valid(x.high)?x.high:x.close); lows.unshift(valid(x.low)?x.low:x.close); dates.unshift(x.date);}); break; }catch(_){} } } if(!closes.length) return null; return {closes, highs, lows, dates, date:dates.at(-1)||today(), source:'TWSE TAIEX', sourceUrl:'https://www.twse.com.tw/'}; }
 async function getMarket(){ const r={updatedAt:new Date().toISOString(), usdTwd:null, twIndex:null, sp500:null, nasdaq:null, vix:null, fearGreed:null, taiwanBusiness:null}; await Promise.allSettled([ (async()=>{const n=await fetchUsdTwd(); if(valid(n)) r.usdTwd={value:n, source:'Frankfurter / ER API', url:'https://www.frankfurter.app/'};})(), (async()=>{const h=await fetchTwIndexHistory(); if(h) r.twIndex={...normalizeHist(h), label:'台股加權'};})(), (async()=>{let h=null; try{h=await fetchStooqHistory('^spx')}catch(_){} if(!h) try{h=await fetchYahooChart('^GSPC','1y')}catch(_){} if(h) r.sp500={...normalizeHist(h), label:'S&P500'};})(), (async()=>{let h=null; try{h=await fetchYahooChart('^IXIC','1y')}catch(_){} if(!h) try{h=await fetchStooqHistory('^ixic')}catch(_){} if(!h) try{h=await fetchStooqHistory('^ndx')}catch(_){} if(h) r.nasdaq={...normalizeHist(h), label:'NASDAQ'};})(), (async()=>{let h=null; try{h=await fetchStooqHistory('^vix')}catch(_){} if(!h) try{h=await fetchYahooChart('^VIX','1mo')}catch(_){} if(h) r.vix={...normalizeHist(h), label:'VIX'};})(), (async()=>{const fg=await fetchFearGreed(); if(fg && Number.isFinite(Number(fg.value)) && fg.value>=0 && fg.value<=100) r.fearGreed=fg;})(), (async()=>{const b=await fetchNdcLightScore(); if(b && Number.isFinite(Number(b.value))) r.taiwanBusiness=b;})() ]); return r; }
-export default { async fetch(request, env, ctx) { const context={request, env, ctx};{ const url=new URL(context.request.url); const path=url.pathname.replace(/^\/api\/?/,''); try{ if(!path||path==='health') return json({ok:true,service:'ETF Radar V4 API',version:'V4.0.2',time:new Date().toISOString()}); if(path==='etf') return json(await getEtf(url.searchParams.get('market'),url.searchParams.get('symbol'))); if(path==='market') return json(await getMarket()); if(path==='debug') { const target=url.searchParams.get('target')||'market'; const symbol=url.searchParams.get('symbol')||'009816'; if(target==='fg') return json(await fetchFearGreed()); if(target==='vixtwn'||target==='ndc') return json(await fetchNdcLightScore()); if(target==='premium') return json(await fetchTwseEtfPremium(symbol)); if(target==='raw'||target==='rawfg') return json(await debugRaw('fg', symbol)); if(target==='rawvixtwn') return json(await debugRaw('vixtwn', symbol)); if(target==='rawndc') return json(await debugRaw('ndc', symbol)); if(target==='rawpremium') return json(await debugRaw('premium', symbol)); return json({market: await getMarket(), premium: await fetchWantgooPremium(symbol), rawFg: await debugRaw('fg', symbol)}); } return json({error:'not found',path},404); }catch(err){ return json({error:err.message||String(err),path},500); } } }
+export default { async fetch(request, env, ctx) { const context={request, env, ctx};{ const url=new URL(context.request.url); const path=url.pathname.replace(/^\/api\/?/,''); try{ if(!path||path==='health') return json({ok:true,service:'ETF Radar V4 API',version:'V4.0.3',time:new Date().toISOString()}); if(path==='etf') return json(await getEtf(url.searchParams.get('market'),url.searchParams.get('symbol'))); if(path==='market') return json(await getMarket()); if(path==='debug') { const target=url.searchParams.get('target')||'market'; const symbol=url.searchParams.get('symbol')||'009816'; if(target==='fg') return json(await fetchFearGreed()); if(target==='vixtwn'||target==='ndc') return json(await fetchNdcLightScore()); if(target==='premium') return json(await fetchTwseEtfPremium(symbol)); if(target==='raw'||target==='rawfg') return json(await debugRaw('fg', symbol)); if(target==='rawvixtwn') return json(await debugRaw('vixtwn', symbol)); if(target==='rawndc') return json(await debugRaw('ndc', symbol)); if(target==='rawpremium') return json(await debugRaw('premium', symbol)); return json({market: await getMarket(), premium: await fetchWantgooPremium(symbol), rawFg: await debugRaw('fg', symbol)}); } return json({error:'not found',path},404); }catch(err){ return json({error:err.message||String(err),path},500); } } }
