@@ -19,45 +19,33 @@ async function fetchWantgooPremium(symbol) {
     const n = Number(String(v ?? '').replace(/%/g, '').replace(/,/g, '').trim());
     return Number.isFinite(n) && Math.abs(n) < 50 ? n : null;
   };
-
-  // 優先抓個別 ETF 頁面的上方報價列：折溢價 0.91%
-  // 這和使用者在玩股網頁面看到的數字一致，比列表頁更不容易抓錯欄位。
   const detailUrl = `https://www.wantgoo.com/stock/etf/${sym.toLowerCase()}`;
   try {
     const raw = await fetchText(detailUrl, 12000);
     const plain = cleanHtml(raw);
-    const idx = plain.toUpperCase().indexOf(sym);
-    const seg = idx >= 0 ? plain.slice(idx, idx + 2500) : plain.slice(0, 2500);
-    const m = seg.match(/折溢價\s*([-+]?\d{1,3}(?:\.\d+)?)\s*%/i);
+    const m = plain.match(/折溢價\s*([-+]?\d{1,3}(?:\.\d+)?)\s*%/i);
     if (m) {
       const n = takeNumber(m[1]);
       if (n !== null) return { premiumDiscount: n, source: '玩股網個股頁折溢價', sourceUrl: detailUrl };
     }
   } catch (_) {}
 
-  // 備援：ETF 淨值折溢價列表。
   const url = 'https://www.wantgoo.com/stock/etf/net-value';
   try {
     const raw = await fetchText(url, 12000);
     const plain = cleanHtml(raw);
-    const parseRow = (seg) => {
-      const row = seg.replace(/\s+/g, ' ').trim();
-      // 列格式：代碼 名稱 淨值 淨值漲跌% 市價 市價漲跌% 折溢價 折溢價%
-      const re = new RegExp(`${sym}\\s+[^0-9]{1,80}\\s+([0-9]{1,5}(?:\\.[0-9]+)?)\\s+[-+]?\\d{1,3}(?:\\.\\d+)?%\\s+([0-9]{1,5}(?:\\.[0-9]+)?)\\s+[-+]?\\d{1,3}(?:\\.\\d+)?%\\s+([-+]?\\d{1,4}(?:\\.\\d+)?)\\s+([-+]?\\d{1,3}(?:\\.\\d+)?)%`, 'i');
-      const m = row.match(re);
-      if (m) return takeNumber(m[4]);
-      const pct = [...row.matchAll(/([-+]?\d{1,3}(?:\.\d+)?)\s*%/g)].map(x => takeNumber(x[1])).filter(x => x !== null);
-      return pct.length >= 3 ? pct[2] : null;
-    };
     const idx = plain.toUpperCase().indexOf(sym);
     if (idx >= 0) {
-      const nextCode = plain.slice(idx + sym.length).search(/\s\d{4,6}[A-Z]?\s/);
-      const seg = plain.slice(idx, nextCode > 0 ? idx + sym.length + nextCode : idx + 700);
-      const n = parseRow(seg);
-      if (n !== null) return { premiumDiscount: n, source: '玩股網 ETF 淨值折溢價', sourceUrl: url };
+      const seg = plain.slice(idx, idx + 600).replace(/,/g, ' ');
+      // 009816 名稱 淨值 淨值漲跌% 市價 市價漲跌% 折溢價 折溢價%
+      const m = seg.match(new RegExp(`${sym}\\s+[^0-9-+]{1,80}\\s+\\d{1,5}(?:\\.\\d+)?\\s+[-+]?\\d{1,3}(?:\\.\\d+)?%\\s+\\d{1,5}(?:\\.\\d+)?\\s+[-+]?\\d{1,3}(?:\\.\\d+)?%\\s+[-+]?\\d{1,4}(?:\\.\\d+)?\\s+([-+]?\\d{1,3}(?:\\.\\d+)?)%`, 'i'));
+      if (m) {
+        const n = takeNumber(m[1]);
+        if (n !== null) return { premiumDiscount: n, source: '玩股網 ETF 淨值折溢價列表', sourceUrl: url };
+      }
     }
-    return null;
-  } catch (_) { return null; }
+  } catch (_) {}
+  return null;
 }
 async function fetchStooqHistory(symbol) { let s = String(symbol || '').trim().toLowerCase(); if (!s) return null; if (!s.startsWith('^') && !s.endsWith('.us')) s += '.us'; const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(s)}&i=d`; const csv = await fetchText(url, 9000); const closes = [], highs = [], lows = [], dates = []; for (const line of csv.trim().split('\n').slice(1).slice(-280)) { const p = line.split(','); if (p.length < 5) continue; const high = Number(p[2]), low = Number(p[3]), close = Number(p[4]); if (!valid(close)) continue; dates.push(p[0]); highs.push(valid(high) ? high : close); lows.push(valid(low) ? low : close); closes.push(close); } if (!closes.length) return null; return { closes, highs, lows, dates, date: dates.at(-1), source: 'Stooq', sourceUrl: `https://stooq.com/q/d/?s=${encodeURIComponent(s)}` }; }
 async function fetchYahooChart(symbol, range = '1y') { const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=${encodeURIComponent(range)}&events=history`; const j = await fetchJson(url, 9000); const res = j?.chart?.result?.[0]; const q = res?.indicators?.quote?.[0]; if (!q) return null; const adj = res?.indicators?.adjclose?.[0]?.adjclose || []; const ts = res?.timestamp || []; const closes = [], highs = [], lows = [], dates = []; (q.close || []).forEach((c, i) => { if (typeof c !== 'number') return; const a = typeof adj[i] === 'number' ? adj[i] : null; const ratio = a && c ? a / c : 1; const close = a || c; const high = typeof q.high?.[i] === 'number' ? q.high[i] * ratio : close; const low = typeof q.low?.[i] === 'number' ? q.low[i] * ratio : close; closes.push(close); highs.push(high); lows.push(low); dates.push(ts[i] ? new Date(ts[i] * 1000).toISOString().slice(0, 10) : today()); }); if (!closes.length) return null; return { closes, highs, lows, dates, date: dates.at(-1), source: 'Yahoo', sourceUrl: `https://finance.yahoo.com/quote/${encodeURIComponent(symbol)}` }; }
@@ -91,27 +79,17 @@ async function fetchWantgooMainNumber(url, kind) {
   if (kind === 'vixtwn') {
     const date = parseDateFromText(plain);
     const okVix = v => Number.isFinite(Number(v)) && Number(v) >= 5 && Number(v) <= 100;
-
-    // 優先鎖定標題列後、開盤欄位前的主報價區。
-    const titleIdx = plain.search(/臺指選擇權波動率指數\s*VIXTWN|台指選擇權波動率指數\s*VIXTWN|VIXTWN/i);
-    const seg = titleIdx >= 0 ? plain.slice(titleIdx, titleIdx + 900) : plain.slice(0, 900);
-    const beforeOpen = seg.split(/開盤|最高|昨收|最低|本益比|股淨比/)[0];
-
+    // 玩股網 HTML 目前格式：VIXTWN 日期 時間 成交量...交易 37.86 0.57 1.53% 開盤...
     const patterns = [
-      /盤後定價交易\s*([0-9]{1,3}\.\d{2})\s*[-+▲▼]?\s*\d{1,3}(?:\.\d+)?\s+[-+]?\d{1,3}(?:\.\d+)?%/i,
-      /一般交易\s*、\s*盤後定價交易\s*([0-9]{1,3}\.\d{2})/i,
-      /VIXTWN\s+20\d{2}[\/\-]\d{1,2}[\/\-]\d{1,2}\s+\d{1,2}:\d{2}[\s\S]{0,220}?([0-9]{1,3}\.\d{2})\s*[-+▲▼]?\s*\d{1,3}(?:\.\d+)?\s+[-+]?\d{1,3}(?:\.\d+)?%/i
+      /VIXTWN\s+(20\d{2}[\/\-]\d{1,2}[\/\-]\d{1,2})\s+\d{1,2}:\d{2}[\s\S]{0,120}?交易\s+([0-9]{1,3}\.\d{2})\s+[-+▲▼]?\d{1,3}(?:\.\d+)?\s+[-+]?\d{1,3}(?:\.\d+)?%/i,
+      /臺指選擇權波動率指數[\s\S]{0,260}?VIXTWN[\s\S]{0,260}?\b([0-9]{1,3}\.\d{2})\b\s+[-+▲▼]?\d{1,3}(?:\.\d+)?\s+[-+]?\d{1,3}(?:\.\d+)?%/i,
+      /VIXTWN[\s\S]{0,260}?\b([0-9]{1,3}\.\d{2})\b\s+[-+▲▼]?\d{1,3}(?:\.\d+)?\s+[-+]?\d{1,3}(?:\.\d+)?%/i
     ];
     for (const re of patterns) {
-      const m = beforeOpen.match(re) || seg.match(re);
-      if (m && okVix(Number(m[1]))) return { value: Number(m[1]), date, source: '玩股網 VIXTWN 主報價', url };
+      const m = plain.match(re);
+      const val = m ? Number(m[m.length - 1]) : null;
+      if (okVix(val)) return { value: val, date, source: '玩股網 VIXTWN 主報價', url };
     }
-
-    // 備援：主報價區第一個「價格 + 漲跌 + 漲跌幅」組合；排除開盤、昨收、最高、最低等欄位。
-    const combo = [...beforeOpen.matchAll(/\b([0-9]{1,3}\.\d{2})\b\s*[-+▲▼]?\s*\d{1,3}(?:\.\d+)?\s+[-+]?\d{1,3}(?:\.\d+)?%/g)]
-      .map(x => Number(x[1]))
-      .find(okVix);
-    if (combo) return { value: combo, date, source: '玩股網 VIXTWN 主報價', url };
   }
   return null;
 }
@@ -122,23 +100,18 @@ async function fetchFearGreed() {
   const ok = n => Number.isFinite(Number(n)) && Number(n) >= 0 && Number(n) <= 100;
   const date = parseDateFromText(plain);
 
-  // 先抓「當日」趨勢表。這筆和中央儀表數字一致，且不會抓到 0/25/50/75/100 刻度。
+  // 優先抓儀表中央數字：... 0 25 50 75 100 ... 極度貪婪 EXTREME GREED 37 市場即時情緒指標
+  const gauge = plain.match(/(?:EXTREME\s+GREED|極度貪婪)\s+(\d{1,3})\s+市場即時情緒指標/i)
+    || plain.match(/Created with Highcharts[\s\S]{0,500}?0\s+25\s+50\s+75\s+100[\s\S]{0,260}?\b(\d{1,3})\b\s+市場即時情緒指標/i);
+  if (gauge && ok(Number(gauge[1])) && ![0,25,50,75,100].includes(Number(gauge[1]))) {
+    return { value: Number(gauge[1]), date, source: '玩股網 F&G 主儀表', url };
+  }
+
   const todayRow = plain.match(/當日\s+(20\d{2}[\/\-]\d{1,2}[\/\-]\d{1,2})\s+(?:極度恐懼|恐懼|中立|極度貪婪|貪婪)\s+(\d{1,3})/i);
   if (todayRow && ok(Number(todayRow[2]))) return { value: Number(todayRow[2]), date: normalizeDateString(todayRow[1]), source: '玩股網 F&G 當日主值', url };
-
-  // 備援：中央 Gauge 數字通常在「市場即時情緒指標」前方。
-  const marker = plain.search(/市場即時情緒指標/i);
-  if (marker >= 0) {
-    const before = plain.slice(Math.max(0, marker - 350), marker);
-    const nums = [...before.matchAll(/\b(\d{1,3})\b/g)].map(m => Number(m[1])).filter(ok);
-    for (let i = nums.length - 1; i >= 0; i--) {
-      const n = nums[i];
-      if (![0,25,50,75,100].includes(n)) return { value: n, date, source: '玩股網 F&G 主儀表', url };
-    }
-  }
   return null;
 }
 async function fetchUsdTwd() { for (const fn of [async()=> (await fetchJson('https://api.frankfurter.app/latest?from=USD&to=TWD', 7000))?.rates?.TWD, async()=> (await fetchJson('https://open.er-api.com/v6/latest/USD', 7000))?.rates?.TWD]) { try { const n = Number(await fn()); if (n > 20 && n < 45) return n; } catch (_) {} } return null; }
 async function fetchTwIndexHistory() { const closes=[], highs=[], lows=[], dates=[]; const now=new Date(); for (let i=0;i<14;i++){ const d=new Date(now.getFullYear(),now.getMonth()-i,1); const date=`${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}01`; for (const url of [`https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST?response=json&date=${date}`,`https://www.twse.com.tw/indicesReport/MI_5MINS_HIST?response=json&date=${date}`]){ try{ const j=await fetchJson(url,7000); const rows=Array.isArray(j?.data)?j.data:[]; if(!rows.length) continue; rows.map(r=>({date:String(r[0]||''), high:num(r[2]), low:num(r[3]), close:num(r[4])})).filter(x=>valid(x.close)).reverse().forEach(x=>{closes.unshift(x.close); highs.unshift(valid(x.high)?x.high:x.close); lows.unshift(valid(x.low)?x.low:x.close); dates.unshift(x.date);}); break; }catch(_){} } } if(!closes.length) return null; return {closes, highs, lows, dates, date:dates.at(-1)||today(), source:'TWSE TAIEX', sourceUrl:'https://www.twse.com.tw/'}; }
 async function getMarket(){ const r={updatedAt:new Date().toISOString(), usdTwd:null, twIndex:null, sp500:null, nasdaq:null, vix:null, fearGreed:null, vixtwn:null}; await Promise.allSettled([ (async()=>{const n=await fetchUsdTwd(); if(valid(n)) r.usdTwd={value:n, source:'Frankfurter / ER API', url:'https://www.frankfurter.app/'};})(), (async()=>{const h=await fetchTwIndexHistory(); if(h) r.twIndex={...normalizeHist(h), label:'台股加權'};})(), (async()=>{let h=null; try{h=await fetchStooqHistory('^spx')}catch(_){} if(!h) try{h=await fetchYahooChart('^GSPC','1y')}catch(_){} if(h) r.sp500={...normalizeHist(h), label:'S&P500'};})(), (async()=>{let h=null; try{h=await fetchYahooChart('^IXIC','1y')}catch(_){} if(!h) try{h=await fetchStooqHistory('^ixic')}catch(_){} if(!h) try{h=await fetchStooqHistory('^ndx')}catch(_){} if(h) r.nasdaq={...normalizeHist(h), label:'NASDAQ'};})(), (async()=>{let h=null; try{h=await fetchStooqHistory('^vix')}catch(_){} if(!h) try{h=await fetchYahooChart('^VIX','1mo')}catch(_){} if(h) r.vix={...normalizeHist(h), label:'VIX'};})(), (async()=>{const fg=await fetchFearGreed(); if(fg && Number.isFinite(Number(fg.value)) && fg.value>=0 && fg.value<=100) r.fearGreed=fg;})(), (async()=>{const v=await fetchWantgooMainNumber('https://www.wantgoo.com/index/vixtwn','vixtwn'); if(v && valid(v.value)) r.vixtwn=v;})() ]); return r; }
-export async function onRequest(context){ const url=new URL(context.request.url); const path=url.pathname.replace(/^\/api\/?/,''); try{ if(!path||path==='health') return json({ok:true,service:'ETF Radar V3 API',version:'V3.3.8',time:new Date().toISOString()}); if(path==='etf') return json(await getEtf(url.searchParams.get('market'),url.searchParams.get('symbol'))); if(path==='market') return json(await getMarket()); if(path==='debug') { const target=url.searchParams.get('target')||'market'; const symbol=url.searchParams.get('symbol')||'009816'; if(target==='fg') return json(await fetchFearGreed()); if(target==='vixtwn') return json(await fetchWantgooMainNumber('https://www.wantgoo.com/index/vixtwn','vixtwn')); if(target==='premium') return json(await fetchWantgooPremium(symbol)); return json({market: await getMarket(), premium: await fetchWantgooPremium(symbol)}); } return json({error:'not found',path},404); }catch(err){ return json({error:err.message||String(err),path},500); } }
+export async function onRequest(context){ const url=new URL(context.request.url); const path=url.pathname.replace(/^\/api\/?/,''); try{ if(!path||path==='health') return json({ok:true,service:'ETF Radar V3 API',version:'V3.3.9',time:new Date().toISOString()}); if(path==='etf') return json(await getEtf(url.searchParams.get('market'),url.searchParams.get('symbol'))); if(path==='market') return json(await getMarket()); if(path==='debug') { const target=url.searchParams.get('target')||'market'; const symbol=url.searchParams.get('symbol')||'009816'; if(target==='fg') return json(await fetchFearGreed()); if(target==='vixtwn') return json(await fetchWantgooMainNumber('https://www.wantgoo.com/index/vixtwn','vixtwn')); if(target==='premium') return json(await fetchWantgooPremium(symbol)); return json({market: await getMarket(), premium: await fetchWantgooPremium(symbol)}); } return json({error:'not found',path},404); }catch(err){ return json({error:err.message||String(err),path},500); } }
