@@ -274,6 +274,100 @@ async function fetchNdcLightScore() {
   return null;
 }
 
+
+const MM_BULLBEAR_URL = 'https://www.macromicro.me/collections/46/tw-stock-relative/142684/taiwan-mm-bull-and-bear-indicator';
+function bullBearLabel(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '';
+  if (n >= 80) return '過熱';
+  if (n >= 60) return '多頭';
+  if (n >= 40) return '中性';
+  if (n >= 20) return '偏空';
+  return '極空';
+}
+async function fetchMacroMicroBullBearRaw() {
+  const html = await fetchText(MM_BULLBEAR_URL, 15000);
+  const plain = cleanHtml(html);
+  return { html, plain };
+}
+async function fetchMacroMicroBullBear() {
+  const { html, plain } = await fetchMacroMicroBullBearRaw();
+  const make = (value, date = null, source = 'MacroMicro 台灣-MM牛熊指數') => {
+    const n = Number(value);
+    if (Number.isFinite(n) && n >= 0 && n <= 100) {
+      return { value: n, label: bullBearLabel(n), date: date || parseDateFromText(plain), source, url: MM_BULLBEAR_URL };
+    }
+    return null;
+  };
+
+  // MacroMicro sidebar normally renders: 最新數據 台灣-MM牛熊指數(L) 2026-05 62.07 前值: 60.00
+  const latestPatterns = [
+    /最新數據[\s\S]{0,800}?台灣[-－]?MM牛熊指數\(L\)\s*(\d{4}-\d{1,2})\s*([0-9]{1,3}(?:\.[0-9]+)?)/i,
+    /台灣[-－]?MM牛熊指數\(L\)\s*(\d{4}-\d{1,2})\s*([0-9]{1,3}(?:\.[0-9]+)?)/i,
+    /台灣[-－]?MM牛熊指數\(L\)[\s\S]{0,120}?([0-9]{1,3}(?:\.[0-9]+)?)[\s\S]{0,60}?前值/i
+  ];
+  for (const re of latestPatterns) {
+    const m = plain.match(re);
+    if (m) {
+      const date = m[2] ? m[1] : null;
+      const value = m[2] || m[1];
+      const out = make(value, date);
+      if (out) return out;
+    }
+  }
+
+  // Fallback: scan only numbers near the exact series name, avoid year/month/index axis values.
+  const idx = plain.search(/台灣[-－]?MM牛熊指數\(L\)|台灣[-－]?MM牛熊指數|MM牛熊指數/i);
+  if (idx >= 0) {
+    const zone = plain.slice(idx, idx + 1000);
+    const nums = [...zone.matchAll(/(?:^|\s)([0-9]{1,3}(?:\.[0-9]+)?)(?=\s|前值|$)/g)]
+      .map(m => Number(m[1]))
+      .filter(n => Number.isFinite(n) && n >= 0 && n <= 100);
+    // Prefer decimal data point, then the first valid value.
+    const decimal = nums.find(n => !Number.isInteger(n));
+    const out = make(decimal ?? nums[0]);
+    if (out) return out;
+  }
+
+  // Some SSR pages embed JSON in __NEXT_DATA__; try to find chart-like values.
+  const next = html.match(/<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i)?.[1];
+  if (next) {
+    try {
+      const txt = next.replace(/&quot;/g,'"').replace(/&amp;/g,'&');
+      const candidates = [...txt.matchAll(/(?:台灣[-－]?MM牛熊指數|bull|bear|142684)[\s\S]{0,500}?([0-9]{1,3}(?:\.[0-9]+)?)/gi)]
+        .map(m => Number(m[1])).filter(n => Number.isFinite(n) && n >= 0 && n <= 100);
+      const decimal = candidates.find(n => !Number.isInteger(n));
+      const out = make(decimal ?? candidates[0]);
+      if (out) return out;
+    } catch (_) {}
+  }
+  return null;
+}
+async function debugMacroMicroBullBear() {
+  const { html, plain } = await fetchMacroMicroBullBearRaw();
+  const anchors = ['台灣-MM牛熊指數','MM牛熊','牛熊','142684','data:','series','chart','Highcharts','__NEXT_DATA__'];
+  const snippets = {};
+  for (const a of anchors) {
+    const idx = plain.indexOf(a);
+    if (idx >= 0) snippets[a] = plain.slice(Math.max(0, idx - 160), idx + 700);
+  }
+  const htmlSnippets = {};
+  for (const a of anchors) {
+    const idx = html.indexOf(a);
+    if (idx >= 0) htmlSnippets[a] = html.slice(Math.max(0, idx - 160), idx + 700);
+  }
+  return {
+    url: MM_BULLBEAR_URL,
+    length: html.length,
+    plainLength: plain.length,
+    parsed: await fetchMacroMicroBullBear(),
+    contains: Object.fromEntries(anchors.map(a => [a, plain.includes(a) || html.includes(a)])),
+    snippets,
+    htmlSnippets,
+    sample: plain.slice(0, 1800)
+  };
+}
+
 async function debugRaw(target, symbol='009816') {
   let url = 'https://production.dataviz.cnn.io/index/fearandgreed/graphdata/' + new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10);
   if (target === 'vixtwn') url = 'https://www.taifex.com.tw/cht/7/vixMinNew';
@@ -291,13 +385,13 @@ async function debugRaw(target, symbol='009816') {
 }
 async function fetchUsdTwd() { for (const fn of [async()=> (await fetchJson('https://api.frankfurter.app/latest?from=USD&to=TWD', 7000))?.rates?.TWD, async()=> (await fetchJson('https://open.er-api.com/v6/latest/USD', 7000))?.rates?.TWD]) { try { const n = Number(await fn()); if (n > 20 && n < 45) return n; } catch (_) {} } return null; }
 async function fetchTwIndexHistory() { const closes=[], highs=[], lows=[], dates=[]; const now=new Date(); for (let i=0;i<14;i++){ const d=new Date(now.getFullYear(),now.getMonth()-i,1); const date=`${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}01`; for (const url of [`https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST?response=json&date=${date}`,`https://www.twse.com.tw/indicesReport/MI_5MINS_HIST?response=json&date=${date}`]){ try{ const j=await fetchJson(url,7000); const rows=Array.isArray(j?.data)?j.data:[]; if(!rows.length) continue; rows.map(r=>({date:String(r[0]||''), high:num(r[2]), low:num(r[3]), close:num(r[4])})).filter(x=>valid(x.close)).reverse().forEach(x=>{closes.unshift(x.close); highs.unshift(valid(x.high)?x.high:x.close); lows.unshift(valid(x.low)?x.low:x.close); dates.unshift(x.date);}); break; }catch(_){} } } if(!closes.length) return null; return {closes, highs, lows, dates, date:dates.at(-1)||today(), source:'TWSE TAIEX', sourceUrl:'https://www.twse.com.tw/'}; }
-async function getMarket(){ const r={updatedAt:new Date().toISOString(), usdTwd:null, twIndex:null, sp500:null, nasdaq:null, vix:null, fearGreed:null, taiwanBusiness:null}; await Promise.allSettled([ (async()=>{const n=await fetchUsdTwd(); if(valid(n)) r.usdTwd={value:n, source:'Frankfurter / ER API', url:'https://www.frankfurter.app/'};})(), (async()=>{const h=await fetchTwIndexHistory(); if(h) r.twIndex={...normalizeHist(h), label:'台股加權'};})(), (async()=>{let h=null; try{h=await fetchStooqHistory('^spx')}catch(_){} if(!h) try{h=await fetchYahooChart('^GSPC','1y')}catch(_){} if(h) r.sp500={...normalizeHist(h), label:'S&P500'};})(), (async()=>{let h=null; try{h=await fetchYahooChart('^IXIC','1y')}catch(_){} if(!h) try{h=await fetchStooqHistory('^ixic')}catch(_){} if(!h) try{h=await fetchStooqHistory('^ndx')}catch(_){} if(h) r.nasdaq={...normalizeHist(h), label:'NASDAQ'};})(), (async()=>{let h=null; try{h=await fetchStooqHistory('^vix')}catch(_){} if(!h) try{h=await fetchYahooChart('^VIX','1mo')}catch(_){} if(h) r.vix={...normalizeHist(h), label:'VIX'};})(), (async()=>{const fg=await fetchFearGreed(); if(fg && Number.isFinite(Number(fg.value)) && fg.value>=0 && fg.value<=100) r.fearGreed=fg;})(), (async()=>{const b=await fetchNdcLightScore(); if(b && Number.isFinite(Number(b.value))) r.taiwanBusiness=b;})() ]); return r; }
+async function getMarket(){ const r={updatedAt:new Date().toISOString(), usdTwd:null, twIndex:null, sp500:null, nasdaq:null, vix:null, fearGreed:null, taiwanBullBear:null}; await Promise.allSettled([ (async()=>{const n=await fetchUsdTwd(); if(valid(n)) r.usdTwd={value:n, source:'Frankfurter / ER API', url:'https://www.frankfurter.app/'};})(), (async()=>{const h=await fetchTwIndexHistory(); if(h) r.twIndex={...normalizeHist(h), label:'台股加權'};})(), (async()=>{let h=null; try{h=await fetchStooqHistory('^spx')}catch(_){} if(!h) try{h=await fetchYahooChart('^GSPC','1y')}catch(_){} if(h) r.sp500={...normalizeHist(h), label:'S&P500'};})(), (async()=>{let h=null; try{h=await fetchYahooChart('^IXIC','1y')}catch(_){} if(!h) try{h=await fetchStooqHistory('^ixic')}catch(_){} if(!h) try{h=await fetchStooqHistory('^ndx')}catch(_){} if(h) r.nasdaq={...normalizeHist(h), label:'NASDAQ'};})(), (async()=>{let h=null; try{h=await fetchStooqHistory('^vix')}catch(_){} if(!h) try{h=await fetchYahooChart('^VIX','1mo')}catch(_){} if(h) r.vix={...normalizeHist(h), label:'VIX'};})(), (async()=>{const fg=await fetchFearGreed(); if(fg && Number.isFinite(Number(fg.value)) && fg.value>=0 && fg.value<=100) r.fearGreed=fg;})(), (async()=>{const b=await fetchMacroMicroBullBear(); if(b && Number.isFinite(Number(b.value))) r.taiwanBullBear=b;})() ]); return r; }
 
 export async function onRequest(context) {
   const url = new URL(context.request.url);
   const path = url.pathname.replace(/^\/api\/?/, '');
   try {
-    if (!path || path === 'health') return json({ ok: true, service: 'ETF Radar V4 API', version: 'V4.0.5', time: new Date().toISOString() });
+    if (!path || path === 'health') return json({ ok: true, service: 'ETF Radar V4 API', version: 'V4.0.7', time: new Date().toISOString() });
     if (path === 'etf') return json(await getEtf(url.searchParams.get('market'), url.searchParams.get('symbol')));
     if (path === 'market') return json(await getMarket());
     if (path === 'debug') {
@@ -306,11 +400,13 @@ export async function onRequest(context) {
       if (target === 'fg') return json(await fetchFearGreed());
       if (target === 'vixtwn' || target === 'ndc') return json(await fetchNdcLightScore());
       if (target === 'premium') return json(await fetchTwseEtfPremium(symbol));
+      if (target === 'bullbear') return json(await fetchMacroMicroBullBear());
+      if (target === 'rawbullbear') return json(await debugMacroMicroBullBear());
       if (target === 'raw' || target === 'rawfg') return json(await debugRaw('fg', symbol));
       if (target === 'rawvixtwn') return json(await debugRaw('vixtwn', symbol));
       if (target === 'rawndc') return json(await debugRaw('ndc', symbol));
       if (target === 'rawpremium') return json(await debugRaw('premium', symbol));
-      return json({ market: await getMarket(), premium: await fetchWantgooPremium(symbol), rawFg: await debugRaw('fg', symbol) });
+      return json({ market: await getMarket(), premium: await fetchTwseEtfPremium(symbol), rawFg: await debugRaw('fg', symbol) });
     }
     return json({ error: 'not found', path }, 404);
   } catch (err) {
