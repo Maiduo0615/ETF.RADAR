@@ -391,7 +391,7 @@ export async function onRequest(context) {
   const url = new URL(context.request.url);
   const path = url.pathname.replace(/^\/api\/?/, '');
   try {
-    if (!path || path === 'health') return json({ ok: true, service: 'ETF Radar V4 API', version: 'V4.0.8', time: new Date().toISOString() });
+    if (!path || path === 'health') return json({ ok: true, service: 'ETF Radar V4 API', version: 'V4.0.9', time: new Date().toISOString() });
     if (path === 'etf') return json(await getEtf(url.searchParams.get('market'), url.searchParams.get('symbol')));
     if (path === 'market') return json(await getMarket());
     if (path === 'debug') {
