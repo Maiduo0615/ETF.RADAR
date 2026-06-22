@@ -6,7 +6,7 @@ function num(v) { const n = Number(String(v ?? '').replace(/,/g, '').replace(/X/
 function mean(a) { return a.reduce((x, y) => x + y, 0) / a.length; }
 function sma(a, n) { return Array.isArray(a) && a.length >= n ? mean(a.slice(-n)) : null; }
 function cleanHtml(html) { return String(html || '').replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/&nbsp;|&#160;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#x2F;|&#47;/g, '/').replace(/,/g, '').replace(/\s+/g, ' ').trim(); }
-async function fetchText(url, timeoutMs = 10000) { const ctl = new AbortController(); const id = setTimeout(() => ctl.abort(), timeoutMs); try { const res = await fetch(url, { signal: ctl.signal, headers: { 'user-agent': 'Mozilla/5.0 (ETF Radar V3)', 'accept': 'text/html,application/json,text/plain,*/*' } }); const body = await res.text(); if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`); return body; } finally { clearTimeout(id); } }
+async function fetchText(url, timeoutMs = 10000, extraHeaders = {}) { const ctl = new AbortController(); const id = setTimeout(() => ctl.abort(), timeoutMs); try { const headers = { 'user-agent': 'Mozilla/5.0 (ETF Radar V4.0.1)', 'accept': 'text/html,application/json,text/plain,*/*', 'cache-control':'no-cache', 'pragma':'no-cache', ...extraHeaders }; const u = String(url); if (u.includes('mis.twse.com.tw')) headers.referer = headers.referer || 'https://mis.twse.com.tw/stock/etf_nav.jsp?ex=tse'; if (u.includes('taifex.com.tw')) headers.referer = headers.referer || 'https://www.taifex.com.tw/cht/7/vixMinNew'; const res = await fetch(url, { signal: ctl.signal, headers }); const body = await res.text(); if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`); return body; } finally { clearTimeout(id); } }
 async function fetchJson(url, timeoutMs = 10000) { return JSON.parse(await fetchText(url, timeoutMs)); }
 function normalizeHist(h) { if (!h || !h.closes?.length) return null; const highs = h.highs.slice(-252).filter(valid); const lows = h.lows.slice(-252).filter(valid); const high52 = highs.length ? Math.max(...highs) : null; const low52 = lows.length ? Math.min(...lows) : null; return { price: h.closes.at(-1), high52, low52, yearHigh: high52, yearLow: low52, ma20: sma(h.closes, 20), ma60: sma(h.closes, 60), ma120: sma(h.closes, 120), date: h.date || today(), source: h.source || 'data', sourceUrl: h.sourceUrl || '' }; }
 function adjustSplitSeries(h) { const closes = [...h.closes], highs = [...h.highs], lows = [...h.lows]; for (let i = 1; i < closes.length; i++) { const prev = closes[i - 1], cur = closes[i]; if (!valid(prev) || !valid(cur)) continue; const ratio = cur / prev; if (ratio < 0.55 || ratio > 1.8) { for (let j = 0; j < i; j++) { closes[j] *= ratio; highs[j] *= ratio; lows[j] *= ratio; } } } return { ...h, closes, highs, lows, source: `${h.source || ''}/split-adjusted` }; }
@@ -15,62 +15,64 @@ async function fetchTwseHistory(symbol) { const closes = [], highs = [], lows = 
 async function fetchWantgooTechnical(symbol) { const url = `https://www.wantgoo.com/stock/etf/${String(symbol).toLowerCase()}/technical-chart`; try { const plain = cleanHtml(await fetchText(url, 10000)); const pick = (labels, min = 1, max = 100000) => { for (const label of labels) { const re = new RegExp(`${label}[^0-9]{0,80}([0-9]{1,6}(?:\\.[0-9]+)?)`, 'i'); const m = plain.match(re); if (m) { const n = Number(m[1]); if (valid(n) && n >= min && n <= max) return n; } } return null; }; const ma = n => pick([`MA\\s*${n}`, `${n}T`, `${n}日均線`]); const out = { source: 'Wantgoo technical', sourceUrl: url, price: pick(['收盤價', '成交價', '現價', '收'], 1, 100000), ma20: ma(20), ma60: ma(60), ma120: ma(120) }; const nameMatch = plain.match(new RegExp(`${symbol}\\s*([^\\s|｜,，。]{2,40})\\s*(?:技術分析|ETF|行情)`, 'i')); if (nameMatch) out.name = nameMatch[1].replace(/技術分析|ETF|行情/g, '').trim(); return Object.values(out).some(valid) ? out : null; } catch (_) { return null; } }
 async function fetchTwseEtfPremium(symbol) {
   const sym = String(symbol || '').trim().toUpperCase();
-  const url = 'https://mis.twse.com.tw/stock/data/all_etf.txt';
+  const base = 'https://mis.twse.com.tw/stock/data/all_etf.txt';
+  const url = `${base}?_=${Date.now()}`;
   const takeNumber = (v) => {
-    const n = Number(String(v ?? '').replace(/%/g, '').replace(/,/g, '').trim());
-    return Number.isFinite(n) && Math.abs(n) < 50 ? n : null;
+    const n = Number(String(v ?? '').replace(/%/g, '').replace(/,/g, '').replace(/^\+/, '').trim());
+    return Number.isFinite(n) && Math.abs(n) < 80 ? n : null;
   };
-  const pickCode = (r) => String(r?.a ?? r?.code ?? r?.Code ?? r?.股票代號 ?? r?.ETF代號 ?? r?.['ETF 代號'] ?? r?.證券代號 ?? '').trim().toUpperCase();
-  const pickPremium = (r) => takeNumber(r?.g ?? r?.premiumDiscount ?? r?.折溢價 ?? r?.預估折溢價幅度 ?? r?.['預估折溢價幅度'] ?? r?.['折溢價幅度'] ?? r?.PremiumDiscount);
-  const pickDate = (r) => normalizeDateString(r?.i ?? r?.date ?? r?.資料日期 ?? r?.['資料日期'] ?? today());
-  try {
-    const raw = await fetchText(url, 12000);
-    const candidates = [];
-    function scanArray(arr) {
-      for (const r of arr || []) {
-        if (!r) continue;
-        if (Array.isArray(r)) {
-          const code = String(r[0] ?? '').trim().toUpperCase();
-          if (code === sym) {
-            const n = takeNumber(r[6]);
-            if (n !== null) candidates.push({ premiumDiscount: n, nav: num(r[5]), price: num(r[4]), date: normalizeDateString(r[8] || today()), source: 'TWSE ETF即時淨值/折溢價', sourceUrl: url });
-          }
-        } else if (typeof r === 'object') {
-          const code = pickCode(r);
-          if (code === sym) {
-            const n = pickPremium(r);
-            if (n !== null) candidates.push({ premiumDiscount: n, nav: num(r.f ?? r.nav ?? r.預估淨值 ?? r['投信或總代理人預估淨值']), price: num(r.e ?? r.price ?? r.成交價), date: pickDate(r), source: 'TWSE ETF即時淨值/折溢價', sourceUrl: url });
-          }
+  const normCode = v => String(v ?? '').replace(/[^0-9A-Z]/gi, '').trim().toUpperCase();
+  const pickCode = (r) => normCode(r?.a ?? r?.code ?? r?.Code ?? r?.股票代號 ?? r?.ETF代號 ?? r?.['ETF 代號'] ?? r?.證券代號);
+  const pickPremium = (r) => takeNumber(r?.g ?? r?.pdPercent ?? r?.premiumDiscount ?? r?.折溢價 ?? r?.預估折溢價幅度 ?? r?.['預估折溢價幅度'] ?? r?.['折溢價幅度'] ?? r?.PremiumDiscount);
+  const pickDate = (r) => normalizeDateString(r?.i ?? r?.dataDate ?? r?.date ?? r?.資料日期 ?? r?.['資料日期'] ?? today());
+  const result = [];
+  function push(x) { if (x && x.premiumDiscount !== null && x.premiumDiscount !== undefined) result.push(x); }
+  function scanArray(arr) {
+    for (const r of arr || []) {
+      if (!r) continue;
+      if (Array.isArray(r)) {
+        const code = normCode(r[0]);
+        if (code === sym) {
+          const n = takeNumber(r[6]);
+          if (n !== null) push({ premiumDiscount: n, nav: num(r[5]), price: num(r[4]), date: normalizeDateString(r[8] || today()), source: 'TWSE ETF 即時淨值/折溢價 all_etf', sourceUrl: base });
+        }
+      } else if (typeof r === 'object') {
+        const code = pickCode(r);
+        if (code === sym) {
+          const n = pickPremium(r);
+          if (n !== null) push({ premiumDiscount: n, nav: num(r.f ?? r.estimatedNav ?? r.nav ?? r.預估淨值 ?? r['投信或總代理人預估淨值']), price: num(r.e ?? r.price ?? r.成交價), date: pickDate(r), source: 'TWSE ETF 即時淨值/折溢價 all_etf', sourceUrl: base });
         }
       }
     }
-    // Endpoint may return pure JSON, JSONP-like text, or quoted JSON text.
+  }
+  function walk(x, depth = 0) {
+    if (!x || depth > 4) return;
+    if (Array.isArray(x)) return scanArray(x);
+    if (typeof x === 'object') for (const v of Object.values(x)) walk(v, depth + 1);
+  }
+  try {
+    const raw = await fetchText(url, 15000, { referer: 'https://mis.twse.com.tw/stock/etf_nav.jsp?ex=tse' });
     try {
       let parsed = JSON.parse(raw);
       if (typeof parsed === 'string') parsed = JSON.parse(parsed);
-      if (Array.isArray(parsed)) scanArray(parsed);
-      else if (parsed && typeof parsed === 'object') scanArray(parsed.data || parsed.result || parsed.items || Object.values(parsed).find(Array.isArray) || []);
+      walk(parsed);
     } catch (_) {
       const arrText = raw.match(/\[[\s\S]*\]/)?.[0];
-      if (arrText) {
-        try { scanArray(JSON.parse(arrText)); } catch (_) {}
+      if (arrText) { try { walk(JSON.parse(arrText)); } catch (_) {} }
+      const objRe = new RegExp(`\\{[^{}]*(?:"a"|a)\\s*:?\\s*"?${sym}"?[\\s\\S]*?\\}`, 'i');
+      const m = raw.match(objRe);
+      if (m) {
+        const chunk = m[0];
+        const g = chunk.match(/(?:"g"|\bg)\s*:?\s*"?([+\-]?[0-9]{1,3}(?:\.[0-9]+)?)%?"?/i);
+        const e = chunk.match(/(?:"e"|\be)\s*:?\s*"?([0-9]{1,5}(?:\.[0-9]+)?)"?/i);
+        const f = chunk.match(/(?:"f"|\bf)\s*:?\s*"?([0-9]{1,5}(?:\.[0-9]+)?)"?/i);
+        const i = chunk.match(/(?:"i"|\bi)\s*:?\s*"?([0-9]{8})"?/i);
+        const n = g ? takeNumber(g[1]) : null;
+        if (n !== null) push({ premiumDiscount: n, price: e ? num(e[1]) : null, nav: f ? num(f[1]) : null, date: normalizeDateString(i?.[1] || today()), source: 'TWSE ETF 即時淨值/折溢價 all_etf', sourceUrl: base });
       }
     }
-    // Last fallback: parse delimited line containing the ETF code.
-    if (!candidates.length) {
-      for (const line of raw.split(/\r?\n/)) {
-        if (!line.toUpperCase().includes(sym)) continue;
-        const parts = line.split(/[,\t|]/).map(x => x.replace(/^"|"$/g, '').trim());
-        const idx = parts.findIndex(x => x.toUpperCase() === sym);
-        if (idx >= 0) {
-          const n = takeNumber(parts[idx + 6] ?? parts[6]);
-          if (n !== null) candidates.push({ premiumDiscount: n, date: normalizeDateString(parts[idx + 8] || parts[8] || today()), source: 'TWSE ETF即時淨值/折溢價', sourceUrl: url });
-        }
-      }
-    }
-    if (candidates.length) return candidates[0];
   } catch (_) {}
-  return null;
+  return result[0] || null;
 }
 
 async function fetchWantgooPremium(symbol) { return fetchTwseEtfPremium(symbol); }
@@ -153,6 +155,27 @@ async function fetchFearGreed() {
   return null;
 }
 
+async function fetchWantgooVixtwnMeta() {
+  const url = 'https://www.wantgoo.com/index/vixtwn';
+  try {
+    const html = await fetchText(url, 12000);
+    const plain = cleanHtml(html);
+    const date = parseDateFromText(html) || parseDateFromText(plain);
+    const patterns = [
+      /類股指數\s*([0-9]{1,3}\.[0-9]{1,2})/i,
+      /臺指選擇權波動率指數[^"<>]{0,120}?([0-9]{1,3}\.[0-9]{1,2})/i,
+      /VIXTWN[^"<>]{0,160}?([0-9]{1,3}\.[0-9]{1,2})/i,
+      /content=["'][^"']*?([0-9]{1,3}\.[0-9]{1,2})\s*(?:漲跌幅|[▲▼+\-])/i
+    ];
+    for (const re of patterns) {
+      const m = html.match(re) || plain.match(re);
+      const v = m ? Number(m[1]) : null;
+      if (Number.isFinite(v) && v >= 5 && v <= 100) return { value: v, date, source: 'Wantgoo VIXTWN meta 備援', url };
+    }
+  } catch (_) {}
+  return null;
+}
+
 async function fetchTaifexVixtwn() {
   const urls = [
     'https://www.taifex.com.tw/cht/7/vixMinNew',
@@ -160,21 +183,23 @@ async function fetchTaifexVixtwn() {
   ];
   for (const url of urls) {
     try {
-      const html = await fetchText(url, 12000);
+      const html = await fetchText(url, 12000, { referer: 'https://www.taifex.com.tw/cht/7/vixMinNew' });
       const plain = cleanHtml(html);
-      // TAIFEX page table: 交易日期 臺指選擇權波動率指數, then rows like 2026/06/18 37.86.
       const rows = [...plain.matchAll(/(20\d{2}[\/\-]\d{1,2}[\/\-]\d{1,2})\s+([0-9]{1,3}(?:\.[0-9]{1,2})?)/g)]
         .map(m => ({ date: normalizeDateString(m[1]), value: Number(m[2]) }))
         .filter(x => Number.isFinite(x.value) && x.value >= 5 && x.value <= 100);
-      if (rows.length) return { value: rows[0].value, date: rows[0].date, source: 'TAIFEX 臺指選擇權波動率指數', url };
+      if (rows.length) return { value: rows[0].value, date: rows[0].date, source: 'TAIFEX 臺指選擇權波動率指數下載', url };
     } catch (_) {}
   }
+  // TAIFEX 統計頁目前在 Worker 可抓到日期但常抓不到數值；用 Wantgoo meta 作即時備援。
+  const wg = await fetchWantgooVixtwnMeta();
+  if (wg) return wg;
   return null;
 }
 async function debugRaw(target, symbol='009816') {
   let url = 'https://production.dataviz.cnn.io/index/fearandgreed/graphdata/' + new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10);
   if (target === 'vixtwn') url = 'https://www.taifex.com.tw/cht/7/vixMinNew';
-  if (target === 'premium') url = 'https://mis.twse.com.tw/stock/data/all_etf.txt';
+  if (target === 'premium') url = 'https://mis.twse.com.tw/stock/data/all_etf.txt?_=' + Date.now();
   const raw = await fetchText(url, 12000);
   const plain = cleanHtml(raw);
   const anchors = ['fear_and_greed','score','交易日期','臺指選擇權波動率指數','折溢價','預估折溢價幅度',String(symbol).toUpperCase()];
@@ -188,4 +213,4 @@ async function debugRaw(target, symbol='009816') {
 async function fetchUsdTwd() { for (const fn of [async()=> (await fetchJson('https://api.frankfurter.app/latest?from=USD&to=TWD', 7000))?.rates?.TWD, async()=> (await fetchJson('https://open.er-api.com/v6/latest/USD', 7000))?.rates?.TWD]) { try { const n = Number(await fn()); if (n > 20 && n < 45) return n; } catch (_) {} } return null; }
 async function fetchTwIndexHistory() { const closes=[], highs=[], lows=[], dates=[]; const now=new Date(); for (let i=0;i<14;i++){ const d=new Date(now.getFullYear(),now.getMonth()-i,1); const date=`${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}01`; for (const url of [`https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST?response=json&date=${date}`,`https://www.twse.com.tw/indicesReport/MI_5MINS_HIST?response=json&date=${date}`]){ try{ const j=await fetchJson(url,7000); const rows=Array.isArray(j?.data)?j.data:[]; if(!rows.length) continue; rows.map(r=>({date:String(r[0]||''), high:num(r[2]), low:num(r[3]), close:num(r[4])})).filter(x=>valid(x.close)).reverse().forEach(x=>{closes.unshift(x.close); highs.unshift(valid(x.high)?x.high:x.close); lows.unshift(valid(x.low)?x.low:x.close); dates.unshift(x.date);}); break; }catch(_){} } } if(!closes.length) return null; return {closes, highs, lows, dates, date:dates.at(-1)||today(), source:'TWSE TAIEX', sourceUrl:'https://www.twse.com.tw/'}; }
 async function getMarket(){ const r={updatedAt:new Date().toISOString(), usdTwd:null, twIndex:null, sp500:null, nasdaq:null, vix:null, fearGreed:null, vixtwn:null}; await Promise.allSettled([ (async()=>{const n=await fetchUsdTwd(); if(valid(n)) r.usdTwd={value:n, source:'Frankfurter / ER API', url:'https://www.frankfurter.app/'};})(), (async()=>{const h=await fetchTwIndexHistory(); if(h) r.twIndex={...normalizeHist(h), label:'台股加權'};})(), (async()=>{let h=null; try{h=await fetchStooqHistory('^spx')}catch(_){} if(!h) try{h=await fetchYahooChart('^GSPC','1y')}catch(_){} if(h) r.sp500={...normalizeHist(h), label:'S&P500'};})(), (async()=>{let h=null; try{h=await fetchYahooChart('^IXIC','1y')}catch(_){} if(!h) try{h=await fetchStooqHistory('^ixic')}catch(_){} if(!h) try{h=await fetchStooqHistory('^ndx')}catch(_){} if(h) r.nasdaq={...normalizeHist(h), label:'NASDAQ'};})(), (async()=>{let h=null; try{h=await fetchStooqHistory('^vix')}catch(_){} if(!h) try{h=await fetchYahooChart('^VIX','1mo')}catch(_){} if(h) r.vix={...normalizeHist(h), label:'VIX'};})(), (async()=>{const fg=await fetchFearGreed(); if(fg && Number.isFinite(Number(fg.value)) && fg.value>=0 && fg.value<=100) r.fearGreed=fg;})(), (async()=>{const v=await fetchTaifexVixtwn(); if(v && valid(v.value)) r.vixtwn=v;})() ]); return r; }
-export async function onRequest(context){ const url=new URL(context.request.url); const path=url.pathname.replace(/^\/api\/?/,''); try{ if(!path||path==='health') return json({ok:true,service:'ETF Radar V3 API',version:'V4.0.0',time:new Date().toISOString()}); if(path==='etf') return json(await getEtf(url.searchParams.get('market'),url.searchParams.get('symbol'))); if(path==='market') return json(await getMarket()); if(path==='debug') { const target=url.searchParams.get('target')||'market'; const symbol=url.searchParams.get('symbol')||'009816'; if(target==='fg') return json(await fetchFearGreed()); if(target==='vixtwn') return json(await fetchTaifexVixtwn()); if(target==='premium') return json(await fetchTwseEtfPremium(symbol)); if(target==='raw'||target==='rawfg') return json(await debugRaw('fg', symbol)); if(target==='rawvixtwn') return json(await debugRaw('vixtwn', symbol)); if(target==='rawpremium') return json(await debugRaw('premium', symbol)); return json({market: await getMarket(), premium: await fetchWantgooPremium(symbol), rawFg: await debugRaw('fg', symbol)}); } return json({error:'not found',path},404); }catch(err){ return json({error:err.message||String(err),path},500); } }
+export async function onRequest(context){ const url=new URL(context.request.url); const path=url.pathname.replace(/^\/api\/?/,''); try{ if(!path||path==='health') return json({ok:true,service:'ETF Radar V4 API',version:'V4.0.1',time:new Date().toISOString()}); if(path==='etf') return json(await getEtf(url.searchParams.get('market'),url.searchParams.get('symbol'))); if(path==='market') return json(await getMarket()); if(path==='debug') { const target=url.searchParams.get('target')||'market'; const symbol=url.searchParams.get('symbol')||'009816'; if(target==='fg') return json(await fetchFearGreed()); if(target==='vixtwn') return json(await fetchTaifexVixtwn()); if(target==='premium') return json(await fetchTwseEtfPremium(symbol)); if(target==='raw'||target==='rawfg') return json(await debugRaw('fg', symbol)); if(target==='rawvixtwn') return json(await debugRaw('vixtwn', symbol)); if(target==='rawpremium') return json(await debugRaw('premium', symbol)); return json({market: await getMarket(), premium: await fetchWantgooPremium(symbol), rawFg: await debugRaw('fg', symbol)}); } return json({error:'not found',path},404); }catch(err){ return json({error:err.message||String(err),path},500); } }
