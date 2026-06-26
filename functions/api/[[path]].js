@@ -387,13 +387,89 @@ async function fetchUsdTwd() { for (const fn of [async()=> (await fetchJson('htt
 async function fetchTwIndexHistory() { const closes=[], highs=[], lows=[], dates=[]; const now=new Date(); for (let i=0;i<14;i++){ const d=new Date(now.getFullYear(),now.getMonth()-i,1); const date=`${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}01`; for (const url of [`https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST?response=json&date=${date}`,`https://www.twse.com.tw/indicesReport/MI_5MINS_HIST?response=json&date=${date}`]){ try{ const j=await fetchJson(url,7000); const rows=Array.isArray(j?.data)?j.data:[]; if(!rows.length) continue; rows.map(r=>({date:String(r[0]||''), high:num(r[2]), low:num(r[3]), close:num(r[4])})).filter(x=>valid(x.close)).reverse().forEach(x=>{closes.unshift(x.close); highs.unshift(valid(x.high)?x.high:x.close); lows.unshift(valid(x.low)?x.low:x.close); dates.unshift(x.date);}); break; }catch(_){} } } if(!closes.length) return null; return {closes, highs, lows, dates, date:dates.at(-1)||today(), source:'TWSE TAIEX', sourceUrl:'https://www.twse.com.tw/'}; }
 async function getMarket(){ const r={updatedAt:new Date().toISOString(), usdTwd:null, twIndex:null, sp500:null, nasdaq:null, vix:null, fearGreed:null}; await Promise.allSettled([ (async()=>{const n=await fetchUsdTwd(); if(valid(n)) r.usdTwd={value:n, source:'Frankfurter / ER API', url:'https://www.frankfurter.app/'};})(), (async()=>{const h=await fetchTwIndexHistory(); if(h) r.twIndex={...normalizeHist(h), label:'台股加權'};})(), (async()=>{let h=null; try{h=await fetchStooqHistory('^spx')}catch(_){} if(!h) try{h=await fetchYahooChart('^GSPC','1y')}catch(_){} if(h) r.sp500={...normalizeHist(h), label:'S&P500'};})(), (async()=>{let h=null; try{h=await fetchYahooChart('^IXIC','1y')}catch(_){} if(!h) try{h=await fetchStooqHistory('^ixic')}catch(_){} if(!h) try{h=await fetchStooqHistory('^ndx')}catch(_){} if(h) r.nasdaq={...normalizeHist(h), label:'NASDAQ'};})(), (async()=>{let h=null; try{h=await fetchStooqHistory('^vix')}catch(_){} if(!h) try{h=await fetchYahooChart('^VIX','1mo')}catch(_){} if(h) r.vix={...normalizeHist(h), label:'VIX'};})(), (async()=>{const fg=await fetchFearGreed(); if(fg && Number.isFinite(Number(fg.value)) && fg.value>=0 && fg.value<=100) r.fearGreed=fg;})() ]); return r; }
 
+function compactTwseDate(d) {
+  const s = String(d || '').trim().replace(/-/g, '').replace(/\//g, '');
+  return /^20\d{6}$/.test(s) ? s : '';
+}
+function cleanCell(v) {
+  if (Array.isArray(v)) return v.map(cleanCell).filter(Boolean).join(' ');
+  return String(v ?? '').replace(/<[^>]+>/g, '').replace(/&nbsp;|&#160;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/\s+/g, ' ').trim();
+}
+function firstTable(j, preferWord) {
+  const tables = Array.isArray(j?.tables) ? j.tables : [];
+  if (tables.length) {
+    const hit = tables.find(t => JSON.stringify(t).includes(preferWord || '')) || tables[0];
+    return hit;
+  }
+  return j || {};
+}
+function normalizeTwseReport(j, fallbackTitle, fallbackUrl, preferWord = '') {
+  const t = firstTable(j, preferWord);
+  const fields = (t.fields || j?.fields || t.header || j?.header || []).map(cleanCell);
+  const rawRows = t.data || j?.data || t.rows || j?.rows || [];
+  const rows = (Array.isArray(rawRows) ? rawRows : []).map(r => {
+    if (Array.isArray(r)) return r.map(cleanCell);
+    if (r && typeof r === 'object') return fields.length ? fields.map(f => cleanCell(r[f] ?? r[f.replace(/\s/g,'')] ?? r[Object.keys(r).find(k => cleanCell(k) === f)] ?? '')) : Object.values(r).map(cleanCell);
+    return [cleanCell(r)];
+  }).filter(r => r.some(Boolean));
+  const title = cleanCell(t.title || j?.title || fallbackTitle);
+  const dateText = [title, cleanCell(j?.date || j?.params?.date || j?.subtitle || '')].join(' ');
+  return { title: title || fallbackTitle, date: parseDateFromText(dateText), fields, rows, source: 'TWSE', sourceUrl: fallbackUrl, stat: j?.stat || '' };
+}
+async function fetchFirstOk(urls, preferWord) {
+  let lastErr = null;
+  for (const url of urls) {
+    try {
+      const j = await fetchJson(url, 12000);
+      const hasRows = Array.isArray(j?.data) || Array.isArray(j?.tables?.[0]?.data) || JSON.stringify(j).includes(preferWord || '');
+      if ((j?.stat === 'OK' || hasRows) && !/很抱歉|查無資料|No data/i.test(JSON.stringify(j).slice(0,500))) return { j, url };
+    } catch (e) { lastErr = e; }
+  }
+  if (lastErr) throw lastErr;
+  throw new Error('TWSE report not available');
+}
+async function fetchTwseInstitutionalAmount(dateParam = '') {
+  const d = compactTwseDate(dateParam);
+  const urls = d ? [
+    `https://www.twse.com.tw/rwd/zh/fund/BFI82U?response=json&dayDate=${d}&type=day`,
+    `https://www.twse.com.tw/rwd/zh/fund/BFI82U?response=json&date=${d}`,
+    `https://www.twse.com.tw/fund/BFI82U?response=json&dayDate=${d}&type=day`
+  ] : [
+    'https://www.twse.com.tw/rwd/zh/fund/BFI82U?response=json',
+    'https://www.twse.com.tw/fund/BFI82U?response=json'
+  ];
+  const { j, url } = await fetchFirstOk(urls, '買賣差額');
+  const rep = normalizeTwseReport(j, '三大法人買賣金額統計表', url, '買賣差額');
+  rep.unit = '元';
+  return rep;
+}
+async function fetchTwseMarginBalance(dateParam = '') {
+  const d = compactTwseDate(dateParam);
+  const urls = d ? [
+    `https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date=${d}&selectType=MS`,
+    `https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date=${d}&selectType=MS`
+  ] : [
+    'https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&selectType=MS',
+    'https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&selectType=MS'
+  ];
+  const { j, url } = await fetchFirstOk(urls, '融資');
+  const rep = normalizeTwseReport(j, '信用交易統計', url, '項目');
+  return rep;
+}
+async function getTwseFlow(dateParam = '') {
+  const d = compactTwseDate(dateParam);
+  const [institutions, margin] = await Promise.all([fetchTwseInstitutionalAmount(d), fetchTwseMarginBalance(d)]);
+  return { updatedAt: new Date().toISOString(), requestedDate: d || '', date: institutions.date || margin.date || today(), institutions, margin, sources: [institutions.sourceUrl, margin.sourceUrl] };
+}
+
 export async function onRequest(context) {
   const url = new URL(context.request.url);
   const path = url.pathname.replace(/^\/api\/?/, '');
   try {
-    if (!path || path === 'health') return json({ ok: true, service: 'ETF Radar V4 API', version: 'V4.0.9', time: new Date().toISOString() });
+    if (!path || path === 'health') return json({ ok: true, service: 'ETF Radar V4 API', version: 'V4.0.11', time: new Date().toISOString() });
     if (path === 'etf') return json(await getEtf(url.searchParams.get('market'), url.searchParams.get('symbol')));
     if (path === 'market') return json(await getMarket());
+    if (path === 'twse-flow') return json(await getTwseFlow(url.searchParams.get('date') || ''));
     if (path === 'debug') {
       const target = url.searchParams.get('target') || 'market';
       const symbol = url.searchParams.get('symbol') || '009816';
